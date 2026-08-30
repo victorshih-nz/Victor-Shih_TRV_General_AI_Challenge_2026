@@ -55,13 +55,15 @@ Version 1 trades one contract from `TAKER_FEED`.
 
 ### 3.1 Single Source of Truth
 
-Exchange `E` executions are authoritative.
+Sender-specific execution-bearing events are authoritative.
 
-Hedger subscribes to:
+Hedger subscribes to the exact sender-specific subjects:
 
 - `ex.md.<FEED>.<TAKER_SENDER>`
 - `ex.md.<FEED>.<SENDER>`
 - `ex.md.<FEED>.<HEDGER_SENDER>`
+
+Wildcard `ex.md.<FEED>.*` is investigation-only. It must not be combined with exact sender-specific subscriptions in production accounting because the same underlying physical trade can be delivered twice to the same process.
 
 Hedger maintains:
 
@@ -83,47 +85,55 @@ No process republishes fills into a second accounting stream.
 
 ### 3.2 Execution Side
 
-For:
+For sender-specific execution-bearing events:
+
+- `T`: tracked sender owns the incoming/aggressor order; `trackedSide = aggressorSide`
+- `E`: tracked sender owns the resting order; `trackedSide = opposite(aggressorSide)`
+
+The exchange message format is:
 
 ```text
 <ts> E <incoming> <resting> <qty> <price> <matchid> <aggressorSide>
 ```
 
-If the tracked sender owns `incoming`:
-
-```text
-trackedSide = aggressorSide
-```
-
-If the tracked sender owns `resting`:
-
-```text
-trackedSide = opposite(aggressorSide)
-```
-
-Then:
+For the ordering side being tracked:
 
 ```text
 Buy  => +qty
 Sell => -qty
 ```
 
+Both `T` and `E` are authoritative execution-bearing events for tracked-seat position accounting. A desk subscriber must process both; `E` alone is insufficient because the incoming/aggressor owner receives `T`.
+
 The Hedger keeps bounded execution deduplication state.
 
 Version 1 exact deduplication key:
 
-`(trackedSender, eventTimestamp, matchId, incomingOrderId, restingOrderId, qty, price, aggressorSide)`
+`(trackedSender, eventType, eventTimestamp, matchId, incomingOrderId, restingOrderId, qty, price, aggressorSide)`
 
 Rationale:
 
 - `trackedSender` keeps the two desk sides of an accidental self-trade distinct for accounting.
+- `eventType` distinguishes `T` vs `E` for the same physical match when both sender-specific streams are observed.
 - the remaining fields identify the exact exchange execution event;
 - a JetStream redelivery of the same event produces the same key;
 - separate partial executions remain distinct if timestamp and/or execution identity differs.
 
-Batch 0 must still verify observed `matchId` behaviour, but implementation must not rely on `matchId` alone for deduplication.
+Implementation must not rely on `matchId` alone for deduplication.
 
-### 3.3 Startup Gate (Desk-wide)
+### 3.3 Fill-and-Kill semantics
+
+The checked-in runtime matches the Fill-and-Kill semantics described in `PROTOCOL.md`.
+
+- `F` may execute partially.
+- `Y <n>` reports the immediately traded volume.
+- The unfilled remainder is cancelled immediately.
+- Hedger must never infer requested `F` quantity as filled quantity.
+- Authoritative position change comes from the sender-specific `T` / `E` execution events, not from the requested order size.
+- After any `F` result, re-evaluate actual desk position and use fresh market state before any next hedge attempt.
+- If another grading runtime fills `F` fully, execution-event accounting naturally handles both the full and partial outcomes.
+
+### 3.4 Startup Gate (Desk-wide)
 
 Hedger state begins as `UNKNOWN`.
 
@@ -605,8 +615,6 @@ min(
 9. respect exchange TPS protection,
 10. ignore Minimum Edge for risk reduction,
 11. accept bounded adverse execution price when necessary.
-
-Because protocol v2.3+ F is atomic, the Hedger must not assume a partial F fill. A rejected/unfilled F causes no position change and should be retried only from fresh market state.
 
 ## 18. Market Readiness and Staleness
 
