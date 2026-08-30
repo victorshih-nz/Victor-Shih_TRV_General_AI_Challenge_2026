@@ -93,11 +93,15 @@ Delivery should be fast, but never by weakening trading correctness or risk cont
 
 ### Execution / Position
 
-- Exchange `E` execution events are the authoritative fill source
-- Buy → positive position change; Sell → negative position change
-- Never infer fills solely from order acceptance
-- Multiple execution events must accumulate correctly
-- Duplicate execution delivery must not double-count position
+- Sender-specific exchange `T` and `E` events are the authoritative fill source for tracked-seat position accounting.
+- On `ex.md.<FEED>.<trackedSender>`, `T` represents the tracked sender as incoming/aggressor; `E` represents the tracked sender as resting.
+- For `T`, tracked side = `aggressorSide`; for `E`, tracked side = opposite(`aggressorSide`).
+- Buy → positive position change; Sell → negative position change.
+- Never infer position solely from order acceptance or from the requested order quantity.
+- Fill-and-Kill (`F`) may partially execute: `Y <n>` reports immediate traded volume and any remainder is cancelled. Position still comes from sender-specific `T`/`E` events.
+- Multiple execution-bearing events must accumulate correctly.
+- Duplicate/redelivered execution-bearing events must not double-count position.
+- Production position accounting should use the three exact sender-specific subjects; wildcard subscriptions are for probes/debugging only and must not be combined with the exact subjects for accounting.
 
 ### Desk-wide Startup Gate
 
