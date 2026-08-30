@@ -244,7 +244,44 @@ Do not proceed until Agent B review is complete.
 
 ---
 
-## 11. Docker Requirements
+## 11. Local Docker Development Lifecycle
+
+During normal local development, assume the Docker exchange environment may already be running and reuse it whenever it is healthy.
+
+Before starting or restarting Docker, first run from `candidate/`:
+
+```powershell
+docker compose ps
+```
+
+If NATS and Exchange are already running and healthy, reuse them.
+
+Do **not** automatically run any of the following before each probe, code edit, or test:
+
+```text
+docker compose down
+docker compose up
+./run.sh
+wsl bash ./run.sh
+```
+
+Restart/recreate the Docker stack only when at least one is true:
+
+- the current Job explicitly requires a fresh empty-book environment,
+- container state is inconsistent,
+- NATS or Exchange is unavailable/unhealthy,
+- Docker/runtime configuration changed and requires rebuild/restart,
+- Agent B explicitly requests a clean restart.
+
+For ordinary host-side probe changes under `candidate/probes/`, changing Python code does not require rebuilding or restarting Docker.
+
+When a test requires empty-book determinism, do not restart the full stack by default. First determine whether the current state can be cleaned or isolated safely; restart only when necessary for reliable evidence.
+
+Never restart Docker merely because source code changed unless the changed component is running from a built container image that must be rebuilt/restarted for that test.
+
+---
+
+## 12. Docker Requirements
 
 - Build from source inside Dockerfiles
 - No host-only dependencies
@@ -255,7 +292,7 @@ Do not proceed until Agent B review is complete.
 
 ---
 
-## 12. CI Requirement
+## 13. CI Requirement
 
 GitHub Actions is the automated judge.
 
@@ -265,7 +302,7 @@ Do not weaken or remove tests merely to make CI green.
 
 ---
 
-## 13. AI / Submission Evidence
+## 14. AI / Submission Evidence
 
 Required:
 
