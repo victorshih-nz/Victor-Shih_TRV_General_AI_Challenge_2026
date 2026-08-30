@@ -416,3 +416,46 @@ Interpretation:
 - `remainder does not rest` because the leftover order is canceled immediately
 
 This Job does not change the future Hedger startup gate. The startup gate remains deferred and separate from the three Taker correctness fixes, as required by the approved scope.
+
+## Job 1.2A — Quoter Runtime Contract Review
+
+### Question
+What minimum runtime state must the Quoter trust before becoming ready?
+
+### Check
+Asked the implementation agent to independently review PROTOCOL.md,
+DESIGN.md and the existing Job 1.1 readiness classes.
+
+### Observation
+The agent correctly identified EX_META, ex.bbo.<FEED>, TAKER_FEED and
+fail-closed BBO readiness, but incorrectly reported that desk.risk.<FEED>
+had no defined wire schema.
+
+### Verification
+Re-read DESIGN.md. The desk-risk payload is explicitly defined as:
+
+<ts_ns> <seq> <feed> <net_position> <soft_limit> <hard_limit>
+<UNKNOWN|SAFE|CONTROLLED|EMERGENCY> <B|S|X>
+
+The design also requires monotonic sequence handling and a 1000 ms
+risk-staleness threshold.
+
+### Decision
+Job 1.2 will parse and validate the complete risk message.
+
+Readiness will directly use timestamp, sequence, feed and state.
+Position/limits/hedge direction will be retained for the existing wire
+contract but will not yet drive quoting behaviour.
+
+Known NATS disconnection will fail readiness closed immediately rather
+than waiting for freshness timeouts.
+
+Qwen 7B
+→ produced bounded parser draft
+→ first draft had constructor/test contradiction
+→ reviewer rejected it
+→ second draft corrected invariants
+→ final code accepted after human/reviewer inspection
+
+Real repo / Maven
+→ will provide actual verification evidence
