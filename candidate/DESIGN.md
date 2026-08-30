@@ -3,17 +3,25 @@
 ## 1. Design Principles
 
 1. Capital preservation first.
+
 2. Never take unnecessary risk for turnover.
+
 3. Inventory control overrides valuation opportunity.
+
 4. Desk risk reduction overrides ordinary quote economics.
+
 5. Complexity must earn its place through measurable improvement.
 
 Executable priority:
 
 1. Hard Risk / Emergency
+
 2. Soft Risk / Controlled reduction
+
 3. Minimum Edge
+
 4. Valuation signal
+
 5. Spread capture / competitiveness
 
 Ordinary quoting must not intentionally submit negative-expectancy prices merely to obtain fills.
@@ -23,30 +31,55 @@ Controlled trading cost is acceptable when reducing dangerous exposure.
 ## 2. Architecture
 
 ```text
-                         Exchange
-                            |
-                  NATS / JetStream / KV
-                            |
-          +-----------------+-----------------+
-          |                 |                 |
-       Taker             Quoter            Hedger
-       Python              Java             Python
-          |                 |                 |
-          |        own inventory only         |
-          |                 |                 |
-          +------ Exchange E executions ------+
-                            |
-                            v
-                   Hedger position engine
-                            |
-                    Desk net position
-                            |
-                            v
-                    desk.risk.<FEED>
-                            |
-                            v
-                         Quoter
-                    side suppression
+
+                         Exchange
+
+                            |
+
+                  NATS / JetStream / KV
+
+                            |
+
+          +-----------------+-----------------+
+
+          |                 |                 |
+
+       Taker             Quoter            Hedger
+
+       Python              Java             Python
+
+          |                 |                 |
+
+          |        own inventory only         |
+
+          |                 |                 |
+
+          +------ Exchange E executions ------+
+
+                            |
+
+                            v
+
+                   Hedger position engine
+
+                            |
+
+                    Desk net position
+
+                            |
+
+                            v
+
+                    desk.risk.<FEED>
+
+                            |
+
+                            v
+
+                         Quoter
+
+                    side suppression
+
 ```
 
 Version 1 trades one contract from `TAKER_FEED`.
@@ -60,7 +93,9 @@ Sender-specific execution-bearing events are authoritative.
 Hedger subscribes to the exact sender-specific subjects:
 
 - `ex.md.<FEED>.<TAKER_SENDER>`
+
 - `ex.md.<FEED>.<SENDER>`
+
 - `ex.md.<FEED>.<HEDGER_SENDER>`
 
 Wildcard `ex.md.<FEED>.*` is investigation-only. It must not be combined with exact sender-specific subscriptions in production accounting because the same underlying physical trade can be delivered twice to the same process.
@@ -68,15 +103,23 @@ Wildcard `ex.md.<FEED>.*` is investigation-only. It must not be combined with ex
 Hedger maintains:
 
 ```text
+
 takerPosition
+
 quoterPosition
+
 hedgerPosition
 
 deskPosition
+
 =
+
 takerPosition
+
 + quoterPosition
+
 + hedgerPosition
+
 ```
 
 Quoter maintains only its own inventory.
@@ -88,19 +131,25 @@ No process republishes fills into a second accounting stream.
 For sender-specific execution-bearing events:
 
 - `T`: tracked sender owns the incoming/aggressor order; `trackedSide = aggressorSide`
+
 - `E`: tracked sender owns the resting order; `trackedSide = opposite(aggressorSide)`
 
 The exchange message format is:
 
 ```text
+
 <ts> E <incoming> <resting> <qty> <price> <matchid> <aggressorSide>
+
 ```
 
 For the ordering side being tracked:
 
 ```text
-Buy  => +qty
+
+Buy  => +qty
+
 Sell => -qty
+
 ```
 
 Both `T` and `E` are authoritative execution-bearing events for tracked-seat position accounting. A desk subscriber must process both; `E` alone is insufficient because the incoming/aggressor owner receives `T`.
@@ -114,9 +163,13 @@ Version 1 exact deduplication key:
 Rationale:
 
 - `trackedSender` keeps the two desk sides of an accidental self-trade distinct for accounting.
+
 - `eventType` distinguishes `T` vs `E` for the same physical match when both sender-specific streams are observed.
+
 - the remaining fields identify the exact exchange execution event;
+
 - a JetStream redelivery of the same event produces the same key;
+
 - separate partial executions remain distinct if timestamp and/or execution identity differs.
 
 Implementation must not rely on `matchId` alone for deduplication.
@@ -126,11 +179,17 @@ Implementation must not rely on `matchId` alone for deduplication.
 The checked-in runtime matches the Fill-and-Kill semantics described in `PROTOCOL.md`.
 
 - `F` may execute partially.
+
 - `Y <n>` reports the immediately traded volume.
+
 - The unfilled remainder is cancelled immediately.
+
 - Hedger must never infer requested `F` quantity as filled quantity.
+
 - Authoritative position change comes from the sender-specific `T` / `E` execution events, not from the requested order size.
+
 - After any `F` result, re-evaluate actual desk position and use fresh market state before any next hedge attempt.
+
 - If another grading runtime fills `F` fully, execution-event accounting naturally handles both the full and partial outcomes.
 
 ### 3.4 Startup Gate (Desk-wide)
@@ -140,20 +199,31 @@ Hedger state begins as `UNKNOWN`.
 Required clean-session sequence:
 
 1. Hedger connects to NATS.
+
 2. Hedger loads and validates instrument metadata.
+
 3. Hedger subscribes to Taker, Quoter, and Hedger sender-specific execution feeds.
+
 4. Hedger subscribes to the configured feed BBO.
+
 5. Hedger flushes/confirms subscriptions are active.
+
 6. Hedger publishes the first non-UNKNOWN `desk.risk.<FEED>` message, normally `SAFE` with position `0` for a fresh gated session.
+
 7. Only after that readiness point may both Taker and Quoter create exposure.
 
 Before readiness:
 
 ```text
-Taker orders  = 0
+
+Taker orders  = 0
+
 Quoter orders = 0
-Taker fills   = 0
-Quoter fills  = 0
+
+Taker fills   = 0
+
+Quoter fills  = 0
+
 ```
 
 A timeout alone must never convert `UNKNOWN` to `SAFE`.
@@ -163,13 +233,21 @@ A timeout alone must never convert `UNKNOWN` to `SAFE`.
 Preferred minimal implementation:
 
 ```text
+
 Taker container/process starts
-        |
-        v
+
+        |
+
+        v
+
 wait for desk-ready
-        |
-        v
+
+        |
+
+        v
+
 exec python taker.py
+
 ```
 
 The readiness signal is satisfied by the first valid non-UNKNOWN Hedger risk state or a deliberately equivalent explicit ready signal.
@@ -179,7 +257,9 @@ This approach keeps legacy trading logic unchanged.
 Alternative:
 
 - add a minimal Taker-side guard that refuses to submit orders while desk state is UNKNOWN,
+
 - only if the container/startup-layer gate is insufficient,
+
 - document it as a risk-correctness exception under the Legacy Taker policy.
 
 The Taker must never be left completely ungated.
@@ -193,12 +273,15 @@ Subject:
 Payload:
 
 ```text
+
 <ts_ns> <seq> <feed> <net_position> <soft_limit> <hard_limit> <UNKNOWN|SAFE|CONTROLLED|EMERGENCY> <B|S|X>
+
 ```
 
 Hedger sends the message:
 
 - on every desk-position or risk-state change, and
+
 - as a heartbeat at least every 250 ms.
 
 `seq` increases monotonically for the lifetime of the Hedger process.
@@ -206,13 +289,17 @@ Hedger sends the message:
 Quoter:
 
 - ignores a sequence lower than the last accepted sequence,
+
 - treats the risk feed as stale after 1000 ms without a valid message,
+
 - on stale risk state, immediately enters `UNKNOWN`, cancels all resting quotes, and submits no new orders.
 
 Last field means required hedge direction:
 
 - `B`: buy reduces desk risk
+
 - `S`: sell reduces desk risk
+
 - `X`: no immediate hedge
 
 This message is advisory. Exchange executions remain authoritative.
@@ -226,7 +313,9 @@ If state is `SAFE`:
 If state is `CONTROLLED` and hedge direction is `S`:
 
 - immediately cancel any active bid that could increase long desk exposure or absorb the Hedger's sell,
+
 - suppress new bids until the risk state improves,
+
 - keep or improve risk-reducing ask subject to controlled-risk rules.
 
 If hedge direction is `B`, apply the opposite behaviour.
@@ -234,9 +323,13 @@ If hedge direction is `B`, apply the opposite behaviour.
 If state is `EMERGENCY`:
 
 - the risk-increasing side must be cancelled immediately,
+
 - cancellation must be dispatched in the same event-processing cycle, with a local target of <= 100 ms from receipt,
+
 - after EMERGENCY is recognised, no new risk-increasing order may be submitted,
+
 - temporary one-sided quoting is explicitly allowed,
+
 - risk-reducing quoting may fully override Minimum Edge.
 
 This coordination also reduces the chance that the Hedger trades against the desk's own Quoter.
@@ -244,50 +337,91 @@ This coordination also reduces the chance that the Hedger trades against the des
 ## 5. Quoter Pricing Model
 
 ```text
+
 Cheap Value < Fair Value < Expensive Value
+
 ```
 
 - Fair Value: central estimate.
+
 - Cheap/Expensive: adaptive opportunity/uncertainty band.
 
 ```text
-                 Market BBO
-                     |
-                     v
-                 Fair Value
-                     |
-        +------------+------------+
-        |                         |
-      Spread                Recent Movement
-        |                         |
-        +------------+------------+
-                     |
-                     v
-              Adaptive Value Band
-              /                 \
-         Cheap Value       Expensive Value
-              \                 /
-               Valuation Signal
-                      |
-                      v
-            Valuation Adjustment
-                      |
+
+                 Market BBO
+
+                     |
+
+                     v
+
+                 Fair Value
+
+                     |
+
+        +------------+------------+
+
+        |                         |
+
+      Spread                Recent Movement
+
+        |                         |
+
+        +------------+------------+
+
+                     |
+
+                     v
+
+              Adaptive Value Band
+
+              /                 \
+
+         Cheap Value       Expensive Value
+
+              \                 /
+
+               Valuation Signal
+
+                      |
+
+                      v
+
+            Valuation Adjustment
+
+                      |
+
 Inventory ------------+
-                      |
-                      v
-               Inventory Skew
-                      |
-                      v
-              Reservation Price
-                      |
-               Minimum Edge
-                      |
-                Risk Controls
-                      |
-               +------+------+
-               |             |
-               v             v
-              Bid           Ask
+
+                      |
+
+                      v
+
+               Inventory Skew
+
+                      |
+
+                      v
+
+              Reservation Price
+
+                      |
+
+               Minimum Edge
+
+                      |
+
+                Risk Controls
+
+                      |
+
+               +------+------+
+
+               |             |
+
+               v             v
+
+              Bid           Ask
+
 ```
 
 ## 6. Fair Value
@@ -295,7 +429,9 @@ Inventory ------------+
 Primary anchor:
 
 ```text
+
 mid = (bestBid + bestAsk) / 2
+
 ```
 
 A bounded top-of-book microprice/imbalance adjustment may shift Fair Value slightly.
@@ -307,24 +443,35 @@ The Quoter remains a market maker, not a directional prediction engine.
 ## 7. Adaptive Value Band
 
 ```text
-cheapValue     = fairValue - valueBand
+
+cheapValue     = fairValue - valueBand
+
 expensiveValue = fairValue + valueBand
+
 ```
 
 Tick-based band:
 
 ```text
+
 valueBandTicks
+
 =
+
 baseBand
+
 + spreadComponent
+
 + volatilityComponent
+
 ```
 
 Bounded:
 
 ```text
+
 MIN_VALUE_BAND <= valueBandTicks <= MAX_VALUE_BAND
+
 ```
 
 ## 8. Short-Term Volatility
@@ -332,10 +479,15 @@ MIN_VALUE_BAND <= valueBandTicks <= MAX_VALUE_BAND
 Use a simple EWMA of absolute Fair Value movement:
 
 ```text
+
 vol_t
+
 =
+
 alpha * abs(fair_t - fair_t-1)
+
 + (1 - alpha) * vol_t-1
+
 ```
 
 Use tick scale, not absolute-price percentage.
@@ -344,17 +496,17 @@ Use tick scale, not absolute-price percentage.
 
 Continuous bounded signal:
 
-```text
 Cheap              Fair               Expensive
  -1                 0                    +1
-```
 
-```text
 valuationAdjustmentTicks
 =
-valuationSignal
+-valuationSignal
 * maxValuationAdjustmentTicks
-```
+
+Cheap (-1)     -> positive adjustment -> reservation price up
+Fair (0)       -> zero adjustment
+Expensive (+1) -> negative adjustment -> reservation price down
 
 All offsets are tick-based, normalized and bounded.
 
@@ -367,9 +519,13 @@ Target Quoter inventory is approximately zero.
 Signed ratio:
 
 ```text
+
 inventoryRatio
+
 =
+
 position / softPositionLimit
+
 ```
 
 ### Non-linear skew
@@ -377,30 +533,47 @@ position / softPositionLimit
 Conceptually:
 
 ```text
+
 skewMagnitude
+
 =
+
 K1 * abs(inventoryRatio)
+
 +
+
 K2 * abs(inventoryRatio)^3
+
 ```
 
 Required behaviour:
 
 | Inventory | Behaviour |
+
 |---|---|
+
 | Small | Mild skew |
+
 | Medium | Meaningful skew |
+
 | Large | Aggressive skew |
+
 | Near hard limit | Risk dominates |
 
 ## 11. Reservation Price
 
 ```text
+
 reservationPrice
+
 =
+
 fairValue
+
 + valuationAdjustment
+
 - inventoryAdjustment
+
 ```
 
 Inventory risk overrides valuation opportunity.
@@ -410,25 +583,35 @@ Inventory risk overrides valuation opportunity.
 ### NORMAL
 
 ```text
+
 abs(position) < softLimit
+
 ```
 
 - two-sided quoting
+
 - Minimum Edge is mandatory
+
 - valuation and spread capture active
 
 ### SOFT RISK
 
 ```text
+
 softLimit <= abs(position) < hardLimit
+
 ```
 
 - inventory skew strengthens
+
 - risk-increasing side becomes less competitive and still requires full Minimum Edge
+
 - risk-reducing side may relax Minimum Edge only to:
 
 ```text
+
 max(1 tick, ceil(normalMinimumEdge / 2))
+
 ```
 
 - desk CONTROLLED state may suppress the risk-increasing side entirely
@@ -436,15 +619,21 @@ max(1 tick, ceil(normalMinimumEdge / 2))
 ### HARD RISK
 
 ```text
+
 abs(position) >= hardLimit
+
 ```
 
 For long Quoter inventory:
 
 1. immediately cancel active bid(s),
+
 2. prohibit new bids that increase long exposure,
+
 3. retain or actively improve ask(s) that reduce long inventory,
+
 4. allow temporary one-sided quoting,
+
 5. fully permit risk-reducing orders to override Minimum Edge.
 
 For short inventory, reverse the sides.
@@ -458,30 +647,43 @@ Normal quoting requires a minimum expected edge relative to Fair Value.
 Initial form:
 
 ```text
+
 minimumEdgeTicks
+
 =
+
 max(
-    minimumTickEdge,
-    volatilityBuffer,
-    hedgeCostBuffer
+
+    minimumTickEdge,
+
+    volatilityBuffer,
+
+    hedgeCostBuffer
+
 )
+
 ```
 
 Priority rules:
 
 ### NORMAL
+
 Minimum Edge cannot be crossed by valuation.
 
 ### SOFT / CONTROLLED
+
 Risk-increasing side retains full Minimum Edge.
 
 Risk-reducing side may relax only to:
 
 ```text
+
 max(1 tick, ceil(normalMinimumEdge / 2))
+
 ```
 
 ### HARD / EMERGENCY
+
 Risk-reducing action may fully ignore Minimum Edge.
 
 Risk-increasing action is prohibited.
@@ -489,22 +691,39 @@ Risk-increasing action is prohibited.
 ## 14. Quote Construction
 
 1. Confirm metadata ready
+
 2. Confirm Hedger state not UNKNOWN
+
 3. Validate fresh two-sided BBO
+
 4. Calculate Fair Value
+
 5. Apply bounded microprice adjustment
+
 6. Update EWMA volatility
+
 7. Calculate adaptive valueBand
+
 8. Derive Cheap/Expensive
+
 9. Calculate normalized valuation signal
+
 10. Calculate valuation adjustment
+
 11. Calculate non-linear inventory skew
+
 12. Calculate reservation price
+
 13. Apply risk-state rules
+
 14. Apply Minimum Edge according to risk priority
+
 15. Round to valid tick
+
 16. Enforce metadata price band
+
 17. Cancel/suppress prohibited side first
+
 18. Submit/cancel/replace remaining quotes safely
 
 ## 15. Risk Limit Configuration
@@ -512,10 +731,15 @@ Risk-increasing action is prohibited.
 Version 1 reads risk thresholds from environment variables:
 
 ```text
+
 QUOTER_SOFT_POS=6
+
 QUOTER_HARD_POS=12
+
 DESK_SOFT_POS=6
+
 DESK_HARD_POS=15
+
 ```
 
 These are initial local defaults and may be tuned only from measured evidence.
@@ -523,9 +747,13 @@ These are initial local defaults and may be tuned only from measured evidence.
 Validation:
 
 ```text
+
 0 < QUOTER_SOFT_POS < QUOTER_HARD_POS
+
 0 < DESK_SOFT_POS < DESK_HARD_POS
+
 QUOTER_HARD_POS <= DESK_HARD_POS
+
 ```
 
 The Quoter effective hard limit must also not exceed the exchange instrument position limit.
@@ -541,9 +769,13 @@ Dynamic quote sizing is deferred unless measured evidence justifies it.
 ## 17. Hedger Design
 
 ```text
+
 Desk Position
+
 =
+
 Taker + Quoter + Hedger
+
 ```
 
 Hedger uses three zones.
@@ -551,31 +783,43 @@ Hedger uses three zones.
 ### SAFE
 
 ```text
+
 abs(deskPosition) <= deskSoftLimit
+
 ```
 
 - publish SAFE
+
 - no hedge
+
 - avoid unnecessary spread crossing
 
 ### CONTROLLED
 
 ```text
+
 deskSoftLimit < abs(deskPosition) < deskHardLimit
+
 ```
 
 Goal:
 
 - reduce exposure back to the safe boundary,
+
 - not necessarily to zero.
 
 Default execution:
 
 - Fill-and-Kill (`F`)
+
 - fresh opposite-side BBO
+
 - bounded clip
+
 - clip no larger than required reduction and preferably no larger than observed executable top-of-book volume
+
 - paced retry only while exposure remains above soft limit
+
 - TPS limits respected
 
 Before sending the hedge, publish CONTROLLED risk direction so Quoter suppresses the side that could work against the hedge.
@@ -583,37 +827,57 @@ Before sending the hedge, publish CONTROLLED risk direction so Quoter suppresses
 ### EMERGENCY
 
 ```text
+
 abs(deskPosition) >= deskHardLimit
+
 ```
 
 Goal:
 
 - leave the hard zone as fast as executable liquidity allows,
+
 - continue toward or inside the soft limit,
+
 - not achieve perfect zero.
 
 Execution:
 
 1. publish EMERGENCY risk state immediately,
+
 2. Quoter cancels risk-increasing resting side,
+
 3. use Fill-and-Kill (`F`) as the hedge order type,
+
 4. compute each hedge clip as:
 
 ```text
+
 min(
-    exposureNeededToSoft,
-    configuredEmergencyClip,
-    currentOppositeBboVolume,
-    exchangeMaxVolume
+
+    exposureNeededToSoft,
+
+    configuredEmergencyClip,
+
+    currentOppositeBboVolume,
+
+    exchangeMaxVolume
+
 )
+
 ```
 
 5. if current opposite BBO volume is smaller than total required reduction, hedge only the currently executable amount,
+
 6. after each F result, immediately re-evaluate desk position and require a fresh BBO before the next hedge,
+
 7. never place a resting `L` order merely to wait for the remaining emergency reduction,
+
 8. if no opposite executable BBO exists, send no order and wait only for fresh market data,
+
 9. respect exchange TPS protection,
+
 10. ignore Minimum Edge for risk reduction,
+
 11. accept bounded adverse execution price when necessary.
 
 ## 18. Market Readiness and Staleness
@@ -621,25 +885,33 @@ min(
 Quoter order entry is disabled until:
 
 - EX_META for the feed is valid,
+
 - valid two-sided BBO exists,
+
 - Hedger desk state is not UNKNOWN.
 
 Initial configurable threshold:
 
 ```text
+
 MARKET_DATA_STALE_MS = 3000
+
 ```
 
 If:
 
 ```text
+
 now - lastValidBboTime > MARKET_DATA_STALE_MS
+
 ```
 
 or the BBO becomes invalid:
 
 1. cancel all Quoter resting orders,
+
 2. submit no new quote,
+
 3. remain fail-closed until fresh valid state returns.
 
 The threshold is configurable and must be tuned cautiously; it is a safety mechanism, not an alpha parameter.
@@ -649,19 +921,25 @@ The threshold is configurable and must be tuned cautiously; it is a safety mecha
 The legacy Taker will not be refactored or behaviourally changed unless:
 
 1. controlled testing confirms a material defect; or
+
 2. a minimal integration change is required to enforce a desk-wide safety invariant, such as preventing order entry before Hedger readiness.
 
 Still prohibited:
 
 - cosmetic refactoring,
+
 - strategy rewrite,
+
 - unrelated momentum-logic changes,
+
 - unrelated cleanup.
 
 Batch 0 must immediately verify:
 
 1. order-entry subject behaviour,
+
 2. sell-side position sign,
+
 3. whether Taker can create exposure before Hedger readiness under the supplied startup path.
 
 The current sell-side implementation is treated as a high-confidence defect hypothesis.
@@ -679,11 +957,17 @@ Safe default:
 Fail-closed conditions include:
 
 - metadata unavailable/invalid,
+
 - Hedger state UNKNOWN,
+
 - no valid BBO,
+
 - BBO stale,
+
 - uncertain order state,
+
 - uncertain position state,
+
 - repeated request failures.
 
 The process may stay alive, but new exposure is prohibited until trusted state returns.
@@ -691,31 +975,59 @@ The process may stay alive, but new exposure is prohibited until trusted state r
 ## 21. Confirmed Decisions
 
 | Decision | Version 1 |
+
 |---|---|
+
 | Quoter | Java |
+
 | Hedger | Python |
+
 | Instrument | Single contract |
+
 | Contract source | `TAKER_FEED` |
+
 | Authoritative desk fills | Exchange `E` events |
+
 | Desk position owner | Hedger |
+
 | Internal coordination | `desk.risk.<FEED>` with seq/position/limits/state/direction |
+
 | Fair Value | midpoint + bounded microprice |
+
 | Cheap / Expensive | adaptive band |
+
 | Value Band | spread + EWMA movement, bounded |
+
 | Price adjustments | normalized tick-based |
+
 | Inventory | non-linear skew |
+
 | Quoter zones | Normal / Soft / Hard |
+
 | Desk zones | Safe / Controlled / Emergency |
+
 | Hedge order type | Fill-and-Kill (`F`) |
+
 | Emergency target | leave hard zone, then move toward soft |
+
 | Temporary one-sided quote | Allowed for risk reduction |
+
 | Market stale default | configurable 3000 ms |
+
 | Risk heartbeat | <=250 ms interval; stale after 1000 ms |
+
 | Emergency cancel dispatch | local target <=100 ms |
+
 | Initial Q soft/hard | 6 / 12 contracts |
+
 | Initial Desk soft/hard | 6 / 15 contracts |
+
 | Dynamic sizing | Deferred |
+
 | Legacy Taker | verify fast, fix immediately if confirmed |
+
 | Primary objective | Capital preservation |
+
 | Normal valuation vs Minimum Edge | Minimum Edge wins |
+
 | Risk reduction vs Minimum Edge | Risk reduction wins |
