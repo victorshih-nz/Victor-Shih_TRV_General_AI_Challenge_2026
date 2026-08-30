@@ -1,316 +1,189 @@
 # GitHub Copilot Repository Instructions
 
-## 1. Project Context
+Work only on the current explicitly assigned Job.
 
-This repository contains the TRV General AI Challenge 2026 trading desk.
+Primary working directory: `candidate/`.
 
-Primary working directory: `candidate/`
+## 1. Scope and Authority
 
-Desk components:
+- Implement only the current Job and stop when it is complete.
+- Do not begin the next Job automatically.
+- Do not add speculative features, abstractions, refactors, or unrelated cleanup.
+- Do not change architecture, protocol interpretation, risk limits, pricing rules, or startup behaviour unless the current Job explicitly requires it.
+- Do not modify legacy Taker code unless the current Job explicitly authorizes a confirmed defect fix or a required desk-wide safety integration.
+- Do not commit, push, merge, rebase, reset, clean, or force-push unless explicitly instructed.
+- If the current prompt conflicts with an explicitly referenced authoritative file, stop and report the conflict instead of inventing a resolution.
 
-- `candidate/taker/` — supplied legacy Python taker
-- `candidate/strategy/` — Java two-sided Quoter to be implemented
-- `candidate/hedger/` — Python Hedger to be implemented
-- NATS / JetStream — exchange messaging
-- Docker Compose — local integration and grading runtime
+Authoritative challenge/runtime sources, when explicitly referenced:
+- `candidate/TASK.md`
+- `candidate/PROTOCOL.md`
+- supplied Docker/runtime configuration
+- the current approved Job prompt / Issue
+- explicitly referenced sections of `candidate/REQUIREMENTS.md` or `candidate/DESIGN.md`
 
-Final grading command:
+## 2. Context Discipline
 
-```bash
-cd candidate
-./run.sh --sim --strategy
-```
+Read only:
+1. files explicitly referenced with `@file` in the current prompt; and
+2. the smallest additional files directly required to compile, test, or resolve a concrete dependency.
 
-The private grading market is not the supplied sample simulator.
-Never implement logic that depends on undocumented behaviour in `candidate/sim/market.py`.
+Do not automatically read:
+- `candidate/DEVELOPMENT_PLAN.md`
+- `candidate/FEATURE_DESIGN_IMPLEMENTATION_PLAN.md`
+- `candidate/TEST_PLAN.md`
+- `candidate/NOTES.md`
+- unrelated source directories
+- unrelated Git history
+- broad repository documentation
 
----
+Do not perform broad repository exploration unless a concrete compile/test/runtime failure makes it necessary.
 
-## 2. Agent Roles
+When extra context is required, inspect the smallest relevant file or section and explain why it was needed.
 
-### Agent A — GitHub Copilot Coding Agent (Developer)
+## 3. Component Constraints
 
-- Implement only the currently approved Job
-- Add focused tests/probes
-- Run required validation
-- Keep changes minimal and reviewable
-- Update `candidate/NOTES.md`
-- Stop before the next Job
+- Quoter: Java.
+- Hedger: Python.
+- Legacy Taker: Python.
+- Desk contract source: `TAKER_FEED`.
+- Quoter sender: `SENDER`.
+- Taker sender: `TAKER_SENDER`.
+- Hedger sender: `HEDGER_SENDER`.
+- NATS connection: `NATS_URL`.
 
-**Hard limits (do not violate):**
+Do not hard-code sample-market feed names, prices, limits, or other simulator constants when environment configuration or exchange metadata provides them.
 
-- Do not invent new architecture
-- Do not add features not present in the current Job
-- Do not "improve" legacy Taker momentum logic
-- Do not change protocols, risk limits, or startup behaviour without approved design revision
-- Do not begin the next Job automatically
+## 4. Trading Safety Invariants
 
-### Agent B — ChatGPT + GitHub (Reviewer / Architect)
+Correctness and capital preservation take priority over profitability and implementation convenience.
 
-- Maintain requirements/design consistency
-- Review actual Git diff
-- Review trading/risk consequences
-- Review tests and CI
-- Approve or reject progression
+Fail closed when critical trading state is uncertain.
 
-### Final Decision Maker
+### Execution and Position Accounting
 
-Victor.
+For tracked-seat accounting, sender-specific exchange `T` and `E` events are authoritative.
 
----
+- `T`: tracked sender owns the incoming/aggressor order.
+- `E`: tracked sender owns the resting order.
+- For `T`, tracked side = `aggressorSide`.
+- For `E`, tracked side = opposite(`aggressorSide`).
+- Buy => positive quantity.
+- Sell => negative quantity.
+- Never infer authoritative position from requested order quantity.
+- Fill-and-Kill (`F`) may execute partially.
+- `Y <n>` is an execution acknowledgement, not a substitute for authoritative execution-event accounting.
+- Accumulate multiple execution events correctly.
+- Duplicate/redelivered execution events must not double-count.
+- Do not combine wildcard and exact sender-specific subscriptions for production position accounting.
 
-## 3. Read Before Changing Code
+### Market and Risk State
 
-For every Job, read the relevant sections of:
+Do not create new exposure when any required critical state is invalid, missing, stale, UNKNOWN, or uncertain, including:
+- metadata,
+- BBO,
+- desk risk,
+- order state,
+- position state.
 
-1. `candidate/REQUIREMENTS.md`
-2. `candidate/DESIGN.md`
-3. `candidate/DEVELOPMENT_PLAN.md`
-4. `candidate/TEST_PLAN.md`
-5. `candidate/FEATURE_DESIGN_IMPLEMENTATION_PLAN.md`
-6. The GitHub Issue defining the current Job
-7. `candidate/TASK.md`
-8. `candidate/PROTOCOL.md`
+A timeout alone must never convert unknown state into trusted state.
 
-If the Issue conflicts with approved requirements/design: **stop and report the conflict**. Do not invent a resolution.
+Normal valuation must not override Minimum Edge.
 
----
+Inventory control overrides valuation opportunity.
 
-## 4. Engineering Priority
+Hard / Emergency risk reduction overrides normal quote economics.
 
-1. Trading correctness
-2. Capital preservation
-3. Risk control
-4. Reliability
-5. Profitability
-6. Delivery speed
+Risk-increasing orders must be suppressed or cancelled where required.
 
-Delivery should be fast, but never by weakening trading correctness or risk control.
+Temporary one-sided quoting is allowed for risk reduction.
 
----
+### Exchange Constraints
 
-## 5. Trading Safety Invariants (Mandatory)
+Respect exchange metadata and protocol constraints, including:
+- tick size,
+- price band,
+- min/max volume,
+- position limit,
+- TPS limit,
+- sender-specific order-entry subjects,
+- valid wire formats.
 
-### Execution / Position
+## 5. Python Environment
 
-- Sender-specific exchange `T` and `E` events are the authoritative fill source for tracked-seat position accounting.
-- On `ex.md.<FEED>.<trackedSender>`, `T` represents the tracked sender as incoming/aggressor; `E` represents the tracked sender as resting.
-- For `T`, tracked side = `aggressorSide`; for `E`, tracked side = opposite(`aggressorSide`).
-- Buy → positive position change; Sell → negative position change.
-- Never infer position solely from order acceptance or from the requested order quantity.
-- Fill-and-Kill (`F`) may partially execute: `Y <n>` reports immediate traded volume and any remainder is cancelled. Position still comes from sender-specific `T`/`E` events.
-- Multiple execution-bearing events must accumulate correctly.
-- Duplicate/redelivered execution-bearing events must not double-count position.
-- Production position accounting should use the three exact sender-specific subjects; wildcard subscriptions are for probes/debugging only and must not be combined with the exact subjects for accounting.
+For local Python probes/tests from `candidate/`, use only:
 
-### Desk-wide Startup Gate
+`.\.probe-venv\Scripts\python.exe`
 
-Before Hedger accounting readiness:
+Do not:
+- use global/system Python,
+- use Anaconda,
+- use `py`,
+- search for alternate Python interpreters,
+- install probe dependencies globally.
 
-```text
-Taker orders  = 0
-Quoter orders = 0
-Taker fills   = 0
-Quoter fills  = 0
-```
+If `.probe-venv` is unavailable or broken, stop and report it.
 
-- Legacy Taker must not be order-active before Hedger publishes the first non-UNKNOWN `desk.risk.<FEED>` state
-- Preferred implementation: container/startup-layer gate (wait for desk-ready → then `exec python taker.py`)
-- Leaving the Taker completely ungated is prohibited
-- A timeout alone must never convert UNKNOWN into a trusted zero position
+## 6. Docker Development
 
-### Market State (Fail Closed)
+Reuse a healthy running Docker stack.
 
-Do not create new exposure when:
+Before Docker work, check:
 
-- metadata is unavailable or invalid
-- BBO is missing, invalid, or stale
-- desk risk state is UNKNOWN
-- order or position state is uncertain
+`docker compose ps`
 
-### Pricing / Risk
+Do not automatically run:
+- `docker compose down`
+- `docker compose up`
+- `./run.sh`
+- `wsl bash ./run.sh`
 
-- Normal valuation must not cross Minimum Edge
-- Inventory control overrides valuation opportunity
-- Hard / Emergency risk reduction overrides normal quote economics and may fully override Minimum Edge
-- Soft / Controlled may only partially relax Minimum Edge (bounds in DESIGN.md)
-- Hard / Emergency must stop the risk-increasing side immediately
-- Temporary one-sided quoting is allowed for risk reduction
-- Do not allow stale resting quotes to accumulate
+Restart/rebuild only when:
+- the current Job explicitly requires a clean runtime,
+- a relevant container image must be rebuilt for the changed component,
+- runtime state is unhealthy/inconsistent,
+- Docker/runtime configuration changed,
+- or the current prompt explicitly requests it.
 
-### Exchange Limits
+Do not restart Docker merely because host-side source or probe code changed.
 
-Respect tick size, price band, min/max volume, position limit, TPS limits.
+## 7. Job Workflow
 
----
+Before editing, run:
 
-## 6. Language Decisions
+`git status --short --branch`
 
-- Quoter: Java (do not switch to Python)
-- Hedger: Python
-- Legacy Taker: Python
+Confirm:
+- the expected branch is active;
+- there are no unexpected unrelated changes.
 
----
+During implementation:
+- make the smallest necessary change;
+- keep trading-critical logic explicit;
+- use production code in tests;
+- add focused regression coverage for changed behaviour;
+- do not weaken existing tests.
 
-## 7. Python Interpreter / Local Probe Environment
+Before reporting:
+- run focused tests relevant to the Job;
+- run the relevant build/test command;
+- run `git diff --check`;
+- run `git status --short`.
 
-For local Python probes and Python test commands, work from the `candidate/` directory and use this interpreter explicitly:
+Run Docker/full integration only when the current Job requires it.
 
-```powershell
-.\.probe-venv\Scripts\python.exe
-```
+Do not modify `.github/workflows/ci.yml` unless a real CI portability/build failure proves a change is necessary.
 
-Examples:
+## 8. Documentation and Reporting
 
-```powershell
-.\.probe-venv\Scripts\python.exe .\probes\protocol_probe.py
-.\.probe-venv\Scripts\python.exe -m py_compile .\probes\protocol_probe.py
-```
+Do not read all of `candidate/NOTES.md` by default.
 
-Rules:
+If the current Job explicitly requires a NOTES update, add only concise evidence, confirmed findings, failures, or design-impacting decisions needed for that Job.
 
-- Do not use the global `python` command for Job probes/tests.
-- Do not use Anaconda/system Python as a substitute when `.probe-venv` exists.
-- Do not install probe dependencies globally.
-- If `.probe-venv` is missing or broken, stop and report it instead of silently switching interpreters.
-- `.vscode/settings.json` points VS Code to the same workspace interpreter.
+Return only the items requested by the current prompt.
 
----
-
-## 8. Legacy Taker Policy
-
-Treat `candidate/taker/` as owned legacy code.
-
-Do not refactor or behaviourally change unless:
-
-1. controlled testing confirms a material defect; or
-2. a minimal integration change is required for a desk-wide safety invariant (e.g. startup gate).
-
-Even then: smallest necessary change + regression coverage + evidence in `NOTES.md`.
-
-Still prohibited: cosmetic refactoring, strategy rewrite, momentum-logic improvement, unrelated cleanup.
-
----
-
-## 9. Scope Control
-
-A change may enter implementation only when it satisfies at least one of:
-
-1. challenge compliance
-2. trading correctness
-3. risk control
-4. measured reliability
-5. measured profitability
-6. grading / submission compatibility
-
-Avoid speculative features, unnecessary abstractions, enterprise frameworks, general-purpose trading-platform architecture, unrelated cleanup.
-
----
-
-## 10. Job Workflow
-
-### Before
-
-```bash
-git status --short --branch
-```
-
-Confirm expected branch, no unrelated changes, current Job scope. If unexpected changes exist → stop and report.
-
-### During
-
-- Work only on the current Job
-- Prefer one clear implementation over many abstractions
-- Keep trading-critical logic explicit
-- Add focused tests/probes with the implementation
-- Copilot Coding Agent may create the automatic draft PR associated with the current Job
-- Do not create additional PRs for the same Job
-- Do not merge the PR
-- Do not begin the next Job automatically
-
-### Before Completion
-
-Run focused tests, relevant broader tests, build checks, Docker validation (where required), `git diff --check`.
-
-Update `candidate/NOTES.md` with assumptions, probes, evidence, confirmed bugs, surprising findings, design-impacting decisions.
-
-Final Job report must include:
-
-1. changed files + purpose
-2. test commands and results
-3. Docker/integration result (if applicable)
-4. `git diff --stat`
-5. known risks
-6. manual checks required
-7. whether the next Job is recommended
-
-Do not proceed until Agent B review is complete.
-
----
-
-## 11. Local Docker Development Lifecycle
-
-During normal local development, assume the Docker exchange environment may already be running and reuse it whenever it is healthy.
-
-Before starting or restarting Docker, first run from `candidate/`:
-
-```powershell
-docker compose ps
-```
-
-If NATS and Exchange are already running and healthy, reuse them.
-
-Do **not** automatically run any of the following before each probe, code edit, or test:
-
-```text
-docker compose down
-docker compose up
-./run.sh
-wsl bash ./run.sh
-```
-
-Restart/recreate the Docker stack only when at least one is true:
-
-- the current Job explicitly requires a fresh empty-book environment,
-- container state is inconsistent,
-- NATS or Exchange is unavailable/unhealthy,
-- Docker/runtime configuration changed and requires rebuild/restart,
-- Agent B explicitly requests a clean restart.
-
-For ordinary host-side probe changes under `candidate/probes/`, changing Python code does not require rebuilding or restarting Docker.
-
-When a test requires empty-book determinism, do not restart the full stack by default. First determine whether the current state can be cleaned or isolated safely; restart only when necessary for reliable evidence.
-
-Never restart Docker merely because source code changed unless the changed component is running from a built container image that must be rebuilt/restarted for that test.
-
----
-
-## 12. Docker Requirements
-
-- Build from source inside Dockerfiles
-- No host-only dependencies
-- Support `linux/amd64`
-- Work through the supplied Docker Compose stack
-- Do not copy locally compiled binaries into final images
-- Do not modify the supplied exchange image unless explicitly required
-
----
-
-## 13. CI Requirement
-
-GitHub Actions is the automated judge.
-
-A Job must not progress while required CI checks are failing unless the failure is confirmed infrastructure-only and documented.
-
-Do not weaken or remove tests merely to make CI green.
-
----
-
-## 14. AI / Submission Evidence
-
-Required:
-
-- `candidate/NOTES.md` (live engineering evidence log)
-- final `TRANSCRIPT.txt`
-
-Preserve AI-agent work so the transcript accurately shows what was asked, assumed, tested, failed, changed, and how decisions were made.
+Do not add:
+- broad repository summaries,
+- long reasoning narratives,
+- speculative future work,
+- next-Job implementation,
+unless explicitly requested.
