@@ -356,6 +356,22 @@ Conclusion:
 - legacy Taker SELL sign defect: CONFIRMED MATERIAL DEFECT
 - legacy Taker subject bug: CONFIRMED
 
+## Job 0.2 — Desk accounting baseline
+
+Implemented a minimal, deterministic desk-accounting core in `candidate/hedger/accounting.py`.
+
+- It accepts a tracked sender and a raw sender-specific execution event.
+- It recognizes execution-bearing `T` and `E` records and ignores other event types for position changes.
+- It resolves the tracked side as `aggressorSide` for `T` and `opposite(aggressorSide)` for `E`.
+- It applies signed buys as `+qty` and sells as `-qty`.
+- It maintains per-sender positions and a desk-net total.
+- It rejects exact duplicates using the v1 key `(trackedSender, eventType, eventTimestamp, matchId, incomingOrderId, restingOrderId, qty, price, aggressorSide)`.
+- It keeps same-`matchId` events distinct when the tracked sender or event type differs, so self-trade and cross-sender accounting are both preserved.
+
+Focused validation:
+- `./.probe-venv/Scripts/python.exe -m unittest tests.test_desk_accounting_baseline tests.test_taker_legacy_regressions`
+- Result: `Ran 17 tests in 0.006s` / `OK`
+
 ## Job 0.3 — Legacy Taker correctness fix
 
 The confirmed legacy defects fixed in this Job were intentionally limited to the three material corrections already proven in the live exchange checks:
