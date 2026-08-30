@@ -1,0 +1,250 @@
+# GitHub Copilot Repository Instructions
+
+## 1. Project Context
+
+This repository contains the TRV General AI Challenge 2026 trading desk.
+
+Primary working directory: `candidate/`
+
+Desk components:
+
+- `candidate/taker/` — supplied legacy Python taker
+- `candidate/strategy/` — Java two-sided Quoter to be implemented
+- `candidate/hedger/` — Python Hedger to be implemented
+- NATS / JetStream — exchange messaging
+- Docker Compose — local integration and grading runtime
+
+Final grading command:
+
+```bash
+cd candidate
+./run.sh --sim --strategy
+```
+
+The private grading market is not the supplied sample simulator.
+Never implement logic that depends on undocumented behaviour in `candidate/sim/market.py`.
+
+---
+
+## 2. Agent Roles
+
+### Agent A — GitHub Copilot Coding Agent (Developer)
+
+- Implement only the currently approved Job
+- Add focused tests/probes
+- Run required validation
+- Keep changes minimal and reviewable
+- Update `candidate/NOTES.md`
+- Stop before the next Job
+
+**Hard limits (do not violate):**
+
+- Do not invent new architecture
+- Do not add features not present in the current Job
+- Do not "improve" legacy Taker momentum logic
+- Do not change protocols, risk limits, or startup behaviour without approved design revision
+- Do not begin the next Job automatically
+
+### Agent B — ChatGPT + GitHub (Reviewer / Architect)
+
+- Maintain requirements/design consistency
+- Review actual Git diff
+- Review trading/risk consequences
+- Review tests and CI
+- Approve or reject progression
+
+### Final Decision Maker
+
+Victor.
+
+---
+
+## 3. Read Before Changing Code
+
+For every Job, read the relevant sections of:
+
+1. `candidate/REQUIREMENTS.md`
+2. `candidate/DESIGN.md`
+3. `candidate/DEVELOPMENT_PLAN.md`
+4. `candidate/TEST_PLAN.md`
+5. `candidate/FEATURE_DESIGN_IMPLEMENTATION_PLAN.md`
+6. The GitHub Issue defining the current Job
+7. `candidate/TASK.md`
+8. `candidate/PROTOCOL.md`
+
+If the Issue conflicts with approved requirements/design: **stop and report the conflict**. Do not invent a resolution.
+
+---
+
+## 4. Engineering Priority
+
+1. Trading correctness
+2. Capital preservation
+3. Risk control
+4. Reliability
+5. Profitability
+6. Delivery speed
+
+Delivery should be fast, but never by weakening trading correctness or risk control.
+
+---
+
+## 5. Trading Safety Invariants (Mandatory)
+
+### Execution / Position
+
+- Exchange `E` execution events are the authoritative fill source
+- Buy → positive position change; Sell → negative position change
+- Never infer fills solely from order acceptance
+- Multiple execution events must accumulate correctly
+- Duplicate execution delivery must not double-count position
+
+### Desk-wide Startup Gate
+
+Before Hedger accounting readiness:
+
+```text
+Taker orders  = 0
+Quoter orders = 0
+Taker fills   = 0
+Quoter fills  = 0
+```
+
+- Legacy Taker must not be order-active before Hedger publishes the first non-UNKNOWN `desk.risk.<FEED>` state
+- Preferred implementation: container/startup-layer gate (wait for desk-ready → then `exec python taker.py`)
+- Leaving the Taker completely ungated is prohibited
+- A timeout alone must never convert UNKNOWN into a trusted zero position
+
+### Market State (Fail Closed)
+
+Do not create new exposure when:
+
+- metadata is unavailable or invalid
+- BBO is missing, invalid, or stale
+- desk risk state is UNKNOWN
+- order or position state is uncertain
+
+### Pricing / Risk
+
+- Normal valuation must not cross Minimum Edge
+- Inventory control overrides valuation opportunity
+- Hard / Emergency risk reduction overrides normal quote economics and may fully override Minimum Edge
+- Soft / Controlled may only partially relax Minimum Edge (bounds in DESIGN.md)
+- Hard / Emergency must stop the risk-increasing side immediately
+- Temporary one-sided quoting is allowed for risk reduction
+- Do not allow stale resting quotes to accumulate
+
+### Exchange Limits
+
+Respect tick size, price band, min/max volume, position limit, TPS limits.
+
+---
+
+## 6. Language Decisions
+
+- Quoter: Java (do not switch to Python)
+- Hedger: Python
+- Legacy Taker: Python
+
+---
+
+## 7. Legacy Taker Policy
+
+Treat `candidate/taker/` as owned legacy code.
+
+Do not refactor or behaviourally change unless:
+
+1. controlled testing confirms a material defect; or
+2. a minimal integration change is required for a desk-wide safety invariant (e.g. startup gate).
+
+Even then: smallest necessary change + regression coverage + evidence in `NOTES.md`.
+
+Still prohibited: cosmetic refactoring, strategy rewrite, momentum-logic improvement, unrelated cleanup.
+
+---
+
+## 8. Scope Control
+
+A change may enter implementation only when it satisfies at least one of:
+
+1. challenge compliance
+2. trading correctness
+3. risk control
+4. measured reliability
+5. measured profitability
+6. grading / submission compatibility
+
+Avoid speculative features, unnecessary abstractions, enterprise frameworks, general-purpose trading-platform architecture, unrelated cleanup.
+
+---
+
+## 9. Job Workflow
+
+### Before
+
+```bash
+git status --short --branch
+```
+
+Confirm expected branch, no unrelated changes, current Job scope. If unexpected changes exist → stop and report.
+
+### During
+
+- Work only on the current Job
+- Prefer one clear implementation over many abstractions
+- Keep trading-critical logic explicit
+- Add focused tests/probes with the implementation
+- Copilot Coding Agent may create the automatic draft PR associated with the current Job
+- Do not create additional PRs for the same Job
+- Do not merge the PR
+- Do not begin the next Job automatically
+
+### Before Completion
+
+Run focused tests, relevant broader tests, build checks, Docker validation (where required), `git diff --check`.
+
+Update `candidate/NOTES.md` with assumptions, probes, evidence, confirmed bugs, surprising findings, design-impacting decisions.
+
+Final Job report must include:
+
+1. changed files + purpose
+2. test commands and results
+3. Docker/integration result (if applicable)
+4. `git diff --stat`
+5. known risks
+6. manual checks required
+7. whether the next Job is recommended
+
+Do not proceed until Agent B review is complete.
+
+---
+
+## 10. Docker Requirements
+
+- Build from source inside Dockerfiles
+- No host-only dependencies
+- Support `linux/amd64`
+- Work through the supplied Docker Compose stack
+- Do not copy locally compiled binaries into final images
+- Do not modify the supplied exchange image unless explicitly required
+
+---
+
+## 11. CI Requirement
+
+GitHub Actions is the automated judge.
+
+A Job must not progress while required CI checks are failing unless the failure is confirmed infrastructure-only and documented.
+
+Do not weaken or remove tests merely to make CI green.
+
+---
+
+## 12. AI / Submission Evidence
+
+Required:
+
+- `candidate/NOTES.md` (live engineering evidence log)
+- final `TRANSCRIPT.txt`
+
+Preserve AI-agent work so the transcript accurately shows what was asked, assumed, tested, failed, changed, and how decisions were made.

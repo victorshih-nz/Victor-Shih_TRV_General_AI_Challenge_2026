@@ -1,0 +1,218 @@
+name: TRV CI
+
+on:
+  push:
+    branches:
+      - main
+      - "batch*/**"
+      - "feature/**"
+      - "fix/**"
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: trv-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  repository-sanity:
+    name: Repository sanity
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Required challenge files
+        shell: bash
+        run: |
+          set -euo pipefail
+          required=(
+            candidate/TASK.md
+            candidate/PROTOCOL.md
+            candidate/README.md
+            candidate/docker-compose.yml
+            candidate/REQUIREMENTS.md
+            candidate/DESIGN.md
+            candidate/DEVELOPMENT_PLAN.md
+            candidate/TEST_PLAN.md
+          )
+
+          for file in "${required[@]}"; do
+            test -f "$file" || {
+              echo "Missing required file: $file"
+              exit 1
+            }
+          done
+
+      - name: Validate Docker Compose syntax
+        working-directory: candidate
+        run: docker compose --profile sim --profile strategy config --quiet
+
+      - name: Check tracked text files for merge markers
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git grep -nE '^(<<<<<<<|=======|>>>>>>>)' -- \
+            ':!candidate/exchange/**'; then
+            echo "Merge-conflict marker found."
+            exit 1
+          fi
+
+  python-checks:
+    name: Python checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Compile Python sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(
+            find candidate/taker candidate/hedger candidate/probes \
+              -type f -name '*.py' 2>/dev/null || true
+          )
+
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "No Python sources found; skipping compile check."
+            exit 0
+          fi
+
+          python -m py_compile "${files[@]}"
+
+      - name: Run pytest when tests exist
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mapfile -t tests < <(
+            find candidate \
+              -type f \
+              \( -name 'test_*.py' -o -name '*_test.py' \) \
+              2>/dev/null || true
+          )
+
+          if [ "${#tests[@]}" -eq 0 ]; then
+            echo "No pytest files found; skipping."
+            exit 0
+          fi
+
+          python -m pip install --quiet pytest
+          python -m pytest -q "${tests[@]}"
+
+  java-quoter:
+    name: Java Quoter
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect Java build system
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f candidate/strategy/pom.xml ]; then
+            echo "build=maven" >> "$GITHUB_OUTPUT"
+          elif [ -f candidate/strategy/gradlew ] || [ -f candidate/strategy/build.gradle ] || [ -f candidate/strategy/build.gradle.kts ]; then
+            echo "build=gradle" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=none" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Java
+        if: steps.detect.outputs.build != 'none'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: ${{ steps.detect.outputs.build }}
+
+      - name: Maven test
+        if: steps.detect.outputs.build == 'maven'
+        working-directory: candidate/strategy
+        run: mvn -B test
+
+      - name: Gradle test
+        if: steps.detect.outputs.build == 'gradle'
+        working-directory: candidate/strategy
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f ./gradlew ]; then
+            chmod +x ./gradlew
+            ./gradlew test
+          else
+            gradle test
+          fi
+
+      - name: No Java project yet
+        if: steps.detect.outputs.build == 'none'
+        run: echo "Java Quoter project has not been created yet; skipping Java tests."
+
+  docker-build:
+    name: Docker build
+    runs-on: ubuntu-latest
+    needs:
+      - repository-sanity
+      - python-checks
+      - java-quoter
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Note: Placeholder Dockerfiles (alpine + sleep) are allowed to build successfully
+      # during Batch 0. Real strategy/hedger images will replace them in later Jobs.
+
+      - name: Build Quoter image
+        run: docker build --platform linux/amd64 -t trv-strategy:ci candidate/strategy
+
+      - name: Build Hedger image
+        run: docker build --platform linux/amd64 -t trv-hedger:ci candidate/hedger
+
+      - name: Build Taker image
+        run: docker build --platform linux/amd64 -t trv-taker:ci candidate/taker
+
+  ci-summary:
+    name: CI gate
+    runs-on: ubuntu-latest
+    needs:
+      - repository-sanity
+      - python-checks
+      - java-quoter
+      - docker-build
+    if: always()
+
+    steps:
+      - name: Verify required jobs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          results=(
+            "${{ needs.repository-sanity.result }}"
+            "${{ needs.python-checks.result }}"
+            "${{ needs.java-quoter.result }}"
+            "${{ needs.docker-build.result }}"
+          )
+
+          printf 'CI job results: %s\n' "${results[@]}"
+
+          for result in "${results[@]}"; do
+            if [ "$result" != "success" ]; then
+              echo "Required CI job did not succeed: $result"
+              exit 1
+            fi
+          done
