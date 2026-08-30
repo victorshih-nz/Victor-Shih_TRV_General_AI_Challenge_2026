@@ -101,10 +101,14 @@ Test:
 
 Test execution events where tracked sender is:
 
-- incoming buyer
-- incoming seller
-- resting buyer
-- resting seller
+- incoming buyer via `T`
+- incoming seller via `T`
+- resting buyer via `E`
+- resting seller via `E`
+- multiple `T` / `E` accumulation across one incoming order
+- exact duplicate `T` / `E` events do not double-count
+- same physical match is counted once for each tracked desk sender, not globally suppressed
+- wildcard + exact subscription duplicate-delivery probe
 
 Test:
 
@@ -112,7 +116,7 @@ Test:
 - Quoter signed position
 - Hedger signed position
 - combined desk position
-- full v1 execution dedup key
+- full v1 execution dedup key with `eventType`
 - duplicate exact event does not change position twice
 - same match involving two tracked desk senders is accounted once per tracked sender, not globally suppressed
 
@@ -132,8 +136,10 @@ Test:
 - clip never exceeds current opposite BBO volume
 - if opposite BBO volume < required reduction, hedge only executable amount and re-evaluate
 - Emergency never uses resting L merely to wait for remaining reduction
-- no position change on rejected/unfilled atomic F
-- retry requires fresh market state
+- partial `F`: requested quantity > executable quantity => `Y` actual quantity, partial execution, remainder cancelled
+- full `F`
+- position is based on `T` / `E`, not requested quantity
+- retry requires fresh market state after partial hedge execution
 - TPS guard
 
 ## 3. Level 2 — Controlled Exchange Probes
@@ -150,8 +156,8 @@ Required:
 - sell fill
 - execution field meanings
 - incoming/resting side inference
-- multiple E
-- F atomic full-or-reject
+- multiple E / T accumulation
+- partial `F` and immediate remainder cancel
 - cancel-many if used
 - STP if used
 - EX_META

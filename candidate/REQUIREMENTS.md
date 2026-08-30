@@ -93,15 +93,15 @@ A local fallback may be provided for development, but production logic must not 
 
 ### 4.1 Authoritative Fill Source
 
-The exchange execution event is the only authoritative fill source.
+The exchange execution-bearing events are the authoritative fill source.
 
-No seat republishes fills as a second accounting stream.
-
-The Hedger subscribes to these exact execution subjects for the configured feed:
+Production desk accounting must subscribe to the exact sender-specific execution subjects for the configured feed:
 
 - `ex.md.<FEED>.<TAKER_SENDER>`
 - `ex.md.<FEED>.<SENDER>`
 - `ex.md.<FEED>.<HEDGER_SENDER>`
+
+Do not combine wildcard `ex.md.<FEED>.*` with exact sender-specific subscriptions for production accounting. In the live runtime, both matching subscriptions can deliver the same underlying physical trade to the same process, which would otherwise double-count a single match.
 
 The Hedger accumulates signed position separately for:
 
@@ -115,18 +115,23 @@ and calculates:
 
 ### 4.2 Execution Interpretation
 
-For an execution event:
+For execution-bearing events:
 
-`<ts> E <incoming:17> <resting:17> <volume> <price> <matchid> <aggressorSide>`
+- `T`: the tracked sender owns the incoming/aggressor order; `trackedSide = aggressorSide`
+- `E`: the tracked sender owns the resting order; `trackedSide = opposite(aggressorSide)`
 
-the Hedger determines which order belongs to the sender being tracked.
+For both `T` and `E` events:
 
-- If the tracked order is the incoming order, its side is `aggressorSide`.
-- If the tracked order is the resting order, its side is the opposite of `aggressorSide`.
 - Buy quantity is positive.
 - Sell quantity is negative.
 
-Execution processing must be idempotent. The implementation shall retain a bounded deduplication key sufficient to avoid processing the same sender execution twice.
+Both `T` and `E` are authoritative execution-bearing events for tracked-seat position accounting. A desk subscriber must not rely on `E` alone because the incoming/aggressor owner receives `T`.
+
+Execution processing must be idempotent. The implementation shall retain a bounded deduplication key sufficient to avoid processing the same sender execution twice across both `T` and `E` events.
+
+Use the v1 dedup key:
+
+`(trackedSender, eventType, eventTimestamp, matchId, incomingOrderId, restingOrderId, qty, price, aggressorSide)`
 
 ### 4.3 Responsibility
 
