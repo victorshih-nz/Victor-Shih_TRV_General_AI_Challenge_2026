@@ -355,3 +355,48 @@ Conclusion:
 - startup exposure: CONFIRMED
 - legacy Taker SELL sign defect: CONFIRMED MATERIAL DEFECT
 - legacy Taker subject bug: CONFIRMED
+
+## Job 0.3 — Legacy Taker correctness fix
+
+The confirmed legacy defects fixed in this Job were intentionally limited to the three material corrections already proven in the live exchange checks:
+
+1. order requests changed from `ex.req` to `ex.req.<configured sender>` with the message sender matching the subject sender
+2. SELL local position accounting changed from `+qty` to `-qty`
+3. accepted `F` orders now use the actual `Y <n>` immediately traded quantity instead of assuming `filled = CLIP`
+
+Focused regression evidence using the project interpreter:
+- `./.probe-venv/Scripts/python.exe -m unittest tests.test_taker_legacy_regressions`
+- Result: `Ran 8 tests in 0.005s` / `OK`
+
+Corrected interpretation of the earlier live trace:
+- The earlier `REPLY 'EXCHANGE Y 5'` trace was a full `F` order that happened to be filled by multiple executions (`3 + 2`), not a partial-fill rejection.
+- The final controlled proof is the relevant partial-`F` regression evidence: requested `F` qty is `5`, total executable opposite liquidity is exactly `3`, the reply is `EXCHANGE Y 3`, and the Taker local position changes by exactly `+3` on the BUY side, with the remainder canceled immediately.
+
+Controlled live regression proof (final recorded evidence):
+- `MAKER_REQUEST_SUBJECT='ex.req.MKRCTRL6'`
+- `MAKER_REQUEST_PAYLOAD='MKRCTRL6 A AAH6 SELL6001 S 3 600 L'`
+- `MAKER_REPLY='EXCHANGE Y 0'`
+- `REQUEST_SUBJECT='ex.req.TKRCTRL6'`
+- `REQUEST_PAYLOAD='TKRCTRL6 A AAH6 BUY60001 B 5 600 F'`
+- `REPLY='EXCHANGE Y 3'`
+- `matchId=12`
+- execution event: `T TKRCTRL6:BUY60001 MKRCTRL6:SELL6001 3 600 12 B`
+- counterparty execution event: `E TKRCTRL6:BUY60001 MKRCTRL6:SELL6001 3 600 12 B`
+- `TAKER_POSITION_BEFORE=0`
+- `TAKER_POSITION_AFTER=3`
+- `ACTUAL_SIGNED_DELTA=+3`
+- remainder cancel: `C TKRCTRL6:BUY60001`
+
+Evidence scope:
+- live integration proves BUY partial `F` 5 -> `Y3` -> `+3`
+- unit regression proves SELL signed accounting is negative
+- do not claim live SELL partial-`F` proof unless one was actually executed
+
+Interpretation:
+- `requested = 5`
+- `Y = 3`
+- `actual execution = 3`
+- `local position delta = +3` for a BUY-side immediate fill
+- `remainder does not rest` because the leftover order is canceled immediately
+
+This Job does not change the future Hedger startup gate. The startup gate remains deferred and separate from the three Taker correctness fixes, as required by the approved scope.
