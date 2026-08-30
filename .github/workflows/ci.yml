@@ -107,7 +107,7 @@ jobs:
             exit 0
           fi
 
-          python -m pip install --quiet pytest
+          python -m pip install --quiet pytest nats-py
           python -m pytest -q "${tests[@]}"
 
   java-quoter:
