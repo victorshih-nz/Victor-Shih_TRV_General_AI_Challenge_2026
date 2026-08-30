@@ -148,7 +148,32 @@ Respect tick size, price band, min/max volume, position limit, TPS limits.
 
 ---
 
-## 7. Legacy Taker Policy
+## 7. Python Interpreter / Local Probe Environment
+
+For local Python probes and Python test commands, work from the `candidate/` directory and use this interpreter explicitly:
+
+```powershell
+.\.probe-venv\Scripts\python.exe
+```
+
+Examples:
+
+```powershell
+.\.probe-venv\Scripts\python.exe .\probes\protocol_probe.py
+.\.probe-venv\Scripts\python.exe -m py_compile .\probes\protocol_probe.py
+```
+
+Rules:
+
+- Do not use the global `python` command for Job probes/tests.
+- Do not use Anaconda/system Python as a substitute when `.probe-venv` exists.
+- Do not install probe dependencies globally.
+- If `.probe-venv` is missing or broken, stop and report it instead of silently switching interpreters.
+- `.vscode/settings.json` points VS Code to the same workspace interpreter.
+
+---
+
+## 8. Legacy Taker Policy
 
 Treat `candidate/taker/` as owned legacy code.
 
@@ -163,7 +188,7 @@ Still prohibited: cosmetic refactoring, strategy rewrite, momentum-logic improve
 
 ---
 
-## 8. Scope Control
+## 9. Scope Control
 
 A change may enter implementation only when it satisfies at least one of:
 
@@ -178,7 +203,7 @@ Avoid speculative features, unnecessary abstractions, enterprise frameworks, gen
 
 ---
 
-## 9. Job Workflow
+## 10. Job Workflow
 
 ### Before
 
@@ -219,7 +244,7 @@ Do not proceed until Agent B review is complete.
 
 ---
 
-## 10. Docker Requirements
+## 11. Docker Requirements
 
 - Build from source inside Dockerfiles
 - No host-only dependencies
@@ -230,7 +255,7 @@ Do not proceed until Agent B review is complete.
 
 ---
 
-## 11. CI Requirement
+## 12. CI Requirement
 
 GitHub Actions is the automated judge.
 
@@ -240,7 +265,7 @@ Do not weaken or remove tests merely to make CI green.
 
 ---
 
-## 12. AI / Submission Evidence
+## 13. AI / Submission Evidence
 
 Required:
 
