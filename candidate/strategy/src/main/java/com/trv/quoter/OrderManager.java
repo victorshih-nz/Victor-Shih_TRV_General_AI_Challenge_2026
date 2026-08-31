@@ -15,58 +15,111 @@ public class OrderManager {
         UNKNOWN
     }
 
+    private enum UnknownCause {
+        NONE,
+        ADD_REQUEST,
+        CANCEL_REQUEST,
+        OTHER
+    }
+
     private static final class Slot {
         private State state = State.EMPTY;
         private String orderId;
+        private int requestedQty;
+        private int filledQty;
+        private UnknownCause unknownCause = UnknownCause.NONE;
     }
 
     private final Slot bid = new Slot();
     private final Slot ask = new Slot();
 
-    public synchronized void beginAdd(Side side, String orderId) {
+    public synchronized void beginAdd(
+            Side side,
+            String orderId,
+            int quantity) {
+
         validateInputs(side, orderId);
+
+        if (quantity <= 0) {
+            throw new IllegalArgumentException(
+                    "quantity must be positive");
+        }
 
         Slot slot = slot(side);
 
         if (slot.state != State.EMPTY) {
-            throw new IllegalStateException("slot already occupied");
+            throw new IllegalStateException(
+                    "slot already occupied");
         }
 
         slot.state = State.PENDING_ADD;
         slot.orderId = orderId;
+        slot.requestedQty = quantity;
+        slot.filledQty = 0;
+        slot.unknownCause = UnknownCause.NONE;
     }
 
-    public synchronized void markActive(Side side, String orderId) {
+    public synchronized void beginCancel(
+            Side side,
+            String orderId) {
+
         validateInputs(side, orderId);
 
         Slot slot = slot(side);
         requireMatchingOrder(slot, orderId);
 
-        if (slot.state != State.PENDING_ADD
-                && slot.state != State.UNKNOWN) {
-            throw new IllegalStateException(
-                    "cannot mark active from state " + slot.state);
+        if (slot.state == State.ACTIVE) {
+            slot.state = State.PENDING_CANCEL;
+            return;
         }
 
-        slot.state = State.ACTIVE;
+        if (slot.state == State.UNKNOWN) {
+            /*
+             * Sending a reconciliation cancel does not resolve UNKNOWN.
+             * Keep the fail-closed state until authoritative evidence arrives.
+             */
+            slot.unknownCause = UnknownCause.CANCEL_REQUEST;
+            return;
+        }
+
+        throw new IllegalStateException(
+                "cannot begin cancel from state " + slot.state);
     }
 
-    public synchronized void beginCancel(Side side, String orderId) {
+    public synchronized void markRequestUncertain(
+            Side side,
+            String orderId) {
+
         validateInputs(side, orderId);
 
         Slot slot = slot(side);
         requireMatchingOrder(slot, orderId);
 
-        if (slot.state != State.ACTIVE
-                && slot.state != State.UNKNOWN) {
-            throw new IllegalStateException(
-                    "cannot begin cancel from state " + slot.state);
+        if (slot.state == State.PENDING_ADD) {
+            slot.state = State.UNKNOWN;
+            slot.unknownCause = UnknownCause.ADD_REQUEST;
+            return;
         }
 
-        slot.state = State.PENDING_CANCEL;
+        if (slot.state == State.PENDING_CANCEL) {
+            slot.state = State.UNKNOWN;
+            slot.unknownCause = UnknownCause.CANCEL_REQUEST;
+            return;
+        }
+
+        if (slot.state == State.UNKNOWN) {
+            // It is already fail-closed.
+            return;
+        }
+
+        throw new IllegalStateException(
+                "request uncertainty only applies to pending or unknown orders");
     }
 
-    public synchronized void markUnknown(Side side, String orderId) {
+    public synchronized void markUnknown(
+            Side side,
+            String orderId) {
+
         validateInputs(side, orderId);
 
         Slot slot = slot(side);
@@ -74,105 +127,128 @@ public class OrderManager {
 
         if (slot.state == State.EMPTY) {
             throw new IllegalStateException(
-                    "cannot mark EMPTY slot as UNKNOWN");
+                    "cannot mark EMPTY slot UNKNOWN");
         }
 
         slot.state = State.UNKNOWN;
+
+        if (slot.unknownCause == UnknownCause.NONE) {
+            slot.unknownCause = UnknownCause.OTHER;
+        }
     }
 
-    public synchronized void markTerminal(Side side, String orderId) {
+    /*
+     * Authoritative A event.
+     *
+     * A confirms the current order has existed as a resting order.
+     * It does not override an already-issued cancel intent.
+     */
+    public synchronized void onResting(
+            Side side,
+            String orderId) {
+
         validateInputs(side, orderId);
 
         Slot slot = slot(side);
-        requireMatchingOrder(slot, orderId);
 
-        if (slot.state == State.EMPTY) {
+        if (!isCurrentOrder(slot, orderId)) {
+            // Late/stale/unrelated lifecycle evidence.
+            return;
+        }
+
+        if (slot.state == State.PENDING_ADD) {
+            slot.state = State.ACTIVE;
+            slot.unknownCause = UnknownCause.NONE;
+            return;
+        }
+
+        if (slot.state == State.UNKNOWN
+                && slot.unknownCause == UnknownCause.ADD_REQUEST) {
+            slot.state = State.ACTIVE;
+            slot.unknownCause = UnknownCause.NONE;
+            return;
+        }
+
+        /*
+         * ACTIVE:
+         * duplicate/late A changes nothing.
+         *
+         * PENDING_CANCEL:
+         * A does not cancel our cancel intent.
+         *
+         * UNKNOWN caused by CANCEL/OTHER:
+         * A is insufficient to resolve uncertainty.
+         */
+    }
+
+    /*
+     * Authoritative E/T execution evidence for this order.
+     *
+     * Execution deduplication must happen before this method.
+     */
+    public synchronized void onExecution(
+            Side side,
+            String orderId,
+            int quantity) {
+
+        validateInputs(side, orderId);
+
+        if (quantity <= 0) {
+            throw new IllegalArgumentException(
+                    "execution quantity must be positive");
+        }
+
+        Slot slot = slot(side);
+
+        if (!isCurrentOrder(slot, orderId)) {
+            /*
+             * Lifecycle ignores late/stale executions for an old order.
+             * Desk position accounting is separate and must still process
+             * legitimate deduplicated E/T events.
+             */
+            return;
+        }
+
+        int newFilledQty = slot.filledQty + quantity;
+
+        if (newFilledQty > slot.requestedQty) {
             throw new IllegalStateException(
-                    "cannot mark EMPTY slot terminal");
+                    "execution quantity exceeds requested order quantity");
         }
 
-        slot.state = State.EMPTY;
-        slot.orderId = null;
+        slot.filledQty = newFilledQty;
+
+        if (slot.filledQty == slot.requestedQty) {
+            clear(slot);
+        }
+
+        /*
+         * Partial fill deliberately preserves lifecycle state:
+         *
+         * PENDING_ADD    -> PENDING_ADD
+         * ACTIVE         -> ACTIVE
+         * PENDING_CANCEL -> PENDING_CANCEL
+         * UNKNOWN        -> UNKNOWN
+         */
     }
 
-    public synchronized void markAddAccepted(
+    /*
+     * Authoritative C event.
+     */
+    public synchronized void onCancelled(
             Side side,
             String orderId) {
 
         validateInputs(side, orderId);
 
         Slot slot = slot(side);
-        requireMatchingOrder(slot, orderId);
-        requireState(slot, State.PENDING_ADD);
 
-        // Request acknowledgement is not authoritative lifecycle evidence.
-        // Keep the order PENDING_ADD until A/E/T/C evidence arrives.
-    }
+        if (!isCurrentOrder(slot, orderId)) {
+            // Late/stale/unrelated cancellation event.
+            return;
+        }
 
-    public synchronized void markAddRejected(
-            Side side,
-            String orderId) {
-
-        validateInputs(side, orderId);
-
-        Slot slot = slot(side);
-        requireMatchingOrder(slot, orderId);
-        requireState(slot, State.PENDING_ADD);
-
-        slot.state = State.UNKNOWN;
-    }
-
-    public synchronized void markAddTimeout(
-            Side side,
-            String orderId) {
-
-        validateInputs(side, orderId);
-
-        Slot slot = slot(side);
-        requireMatchingOrder(slot, orderId);
-        requireState(slot, State.PENDING_ADD);
-
-        slot.state = State.UNKNOWN;
-    }
-
-    public synchronized void markCancelAccepted(
-            Side side,
-            String orderId) {
-
-        validateInputs(side, orderId);
-
-        Slot slot = slot(side);
-        requireMatchingOrder(slot, orderId);
-        requireState(slot, State.PENDING_CANCEL);
-
-        // Request acknowledgement is not authoritative lifecycle evidence.
-        // Keep the order PENDING_CANCEL until A/E/T/C evidence arrives.
-    }
-
-    public synchronized void markCancelRejected(
-            Side side,
-            String orderId) {
-
-        validateInputs(side, orderId);
-
-        Slot slot = slot(side);
-        requireMatchingOrder(slot, orderId);
-        requireState(slot, State.PENDING_CANCEL);
-
-        slot.state = State.UNKNOWN;
-    }
-
-    public synchronized void markCancelTimeout(
-            Side side,
-            String orderId) {
-
-        validateInputs(side, orderId);
-
-        Slot slot = slot(side);
-        requireMatchingOrder(slot, orderId);
-        requireState(slot, State.PENDING_CANCEL);
-
-        slot.state = State.UNKNOWN;
+        clear(slot);
     }
 
     public synchronized State state(Side side) {
@@ -185,6 +261,18 @@ public class OrderManager {
         return slot(side).orderId;
     }
 
+    public synchronized int remainingQty(Side side) {
+        validateSide(side);
+
+        Slot slot = slot(side);
+
+        if (slot.state == State.EMPTY) {
+            return 0;
+        }
+
+        return slot.requestedQty - slot.filledQty;
+    }
+
     public synchronized boolean isReconciled() {
         return bid.state != State.UNKNOWN
                 && ask.state != State.UNKNOWN;
@@ -194,28 +282,31 @@ public class OrderManager {
         return side == Side.BID ? bid : ask;
     }
 
+    private boolean isCurrentOrder(
+            Slot slot,
+            String orderId) {
+
+        return slot.state != State.EMPTY
+                && slot.orderId != null
+                && slot.orderId.equals(orderId);
+    }
+
     private void requireMatchingOrder(
             Slot slot,
             String orderId) {
 
-        if (slot.orderId == null
-                || !slot.orderId.equals(orderId)) {
+        if (!isCurrentOrder(slot, orderId)) {
             throw new IllegalStateException(
-                    "order id does not match slot");
+                    "order id does not match current slot");
         }
     }
 
-    private void requireState(
-            Slot slot,
-            State expectedState) {
-
-        if (slot.state != expectedState) {
-            throw new IllegalStateException(
-                    "expected state "
-                            + expectedState
-                            + " but was "
-                            + slot.state);
-        }
+    private void clear(Slot slot) {
+        slot.state = State.EMPTY;
+        slot.orderId = null;
+        slot.requestedQty = 0;
+        slot.filledQty = 0;
+        slot.unknownCause = UnknownCause.NONE;
     }
 
     private void validateInputs(

@@ -6,8 +6,11 @@ import static org.junit.jupiter.api.Assertions.*;
 
 class OrderManagerTest {
 
+    private static final String BID_ID = "BID00001";
+    private static final String ASK_ID = "ASK00001";
+
     @Test
-    void startsWithBothSlotsEmpty() {
+    void startsEmpty() {
         OrderManager manager = new OrderManager();
 
         assertEquals(
@@ -18,620 +21,611 @@ class OrderManagerTest {
                 OrderManager.State.EMPTY,
                 manager.state(OrderManager.Side.ASK));
 
-        assertNull(
-                manager.orderId(OrderManager.Side.BID));
+        assertNull(manager.orderId(OrderManager.Side.BID));
+        assertNull(manager.orderId(OrderManager.Side.ASK));
 
-        assertNull(
-                manager.orderId(OrderManager.Side.ASK));
+        assertEquals(0, manager.remainingQty(OrderManager.Side.BID));
+        assertEquals(0, manager.remainingQty(OrderManager.Side.ASK));
 
         assertTrue(manager.isReconciled());
     }
 
     @Test
-    void beginAddOccupiesOnlyRequestedSide() {
+    void beginAddStoresRequestedQuantity() {
         OrderManager manager = new OrderManager();
 
         manager.beginAdd(
                 OrderManager.Side.BID,
-                "BID00001");
+                BID_ID,
+                10);
 
         assertEquals(
                 OrderManager.State.PENDING_ADD,
                 manager.state(OrderManager.Side.BID));
 
         assertEquals(
-                "BID00001",
+                BID_ID,
                 manager.orderId(OrderManager.Side.BID));
+
+        assertEquals(
+                10,
+                manager.remainingQty(OrderManager.Side.BID));
+    }
+
+    @Test
+    void bidAndAskRemainIndependent() {
+        OrderManager manager = new OrderManager();
+
+        manager.beginAdd(
+                OrderManager.Side.BID,
+                BID_ID,
+                10);
+
+        manager.beginAdd(
+                OrderManager.Side.ASK,
+                ASK_ID,
+                20);
+
+        manager.onResting(
+                OrderManager.Side.BID,
+                BID_ID);
+
+        assertEquals(
+                OrderManager.State.ACTIVE,
+                manager.state(OrderManager.Side.BID));
+
+        assertEquals(
+                OrderManager.State.PENDING_ADD,
+                manager.state(OrderManager.Side.ASK));
+
+        assertEquals(
+                10,
+                manager.remainingQty(OrderManager.Side.BID));
+
+        assertEquals(
+                20,
+                manager.remainingQty(OrderManager.Side.ASK));
+    }
+
+    @Test
+    void restingEvidenceActivatesPendingAdd() {
+        OrderManager manager = pendingBid(10);
+
+        manager.onResting(
+                OrderManager.Side.BID,
+                BID_ID);
+
+        assertEquals(
+                OrderManager.State.ACTIVE,
+                manager.state(OrderManager.Side.BID));
+    }
+
+    @Test
+    void addUncertaintyCanBeResolvedByRestingEvidence() {
+        OrderManager manager = pendingBid(10);
+
+        manager.markRequestUncertain(
+                OrderManager.Side.BID,
+                BID_ID);
+
+        assertEquals(
+                OrderManager.State.UNKNOWN,
+                manager.state(OrderManager.Side.BID));
+
+        manager.onResting(
+                OrderManager.Side.BID,
+                BID_ID);
+
+        assertEquals(
+                OrderManager.State.ACTIVE,
+                manager.state(OrderManager.Side.BID));
+
+        assertTrue(manager.isReconciled());
+    }
+
+    @Test
+    void cancelUncertaintyIsNotResolvedByRestingEvidence() {
+        OrderManager manager = activeBid(10);
+
+        manager.beginCancel(
+                OrderManager.Side.BID,
+                BID_ID);
+
+        manager.markRequestUncertain(
+                OrderManager.Side.BID,
+                BID_ID);
+
+        manager.onResting(
+                OrderManager.Side.BID,
+                BID_ID);
+
+        assertEquals(
+                OrderManager.State.UNKNOWN,
+                manager.state(OrderManager.Side.BID));
+
+        assertFalse(manager.isReconciled());
+    }
+
+    @Test
+    void restingEvidenceDoesNotOverridePendingCancel() {
+        OrderManager manager = activeBid(10);
+
+        manager.beginCancel(
+                OrderManager.Side.BID,
+                BID_ID);
+
+        manager.onResting(
+                OrderManager.Side.BID,
+                BID_ID);
+
+        assertEquals(
+                OrderManager.State.PENDING_CANCEL,
+                manager.state(OrderManager.Side.BID));
+    }
+
+    @Test
+    void partialFillKeepsActiveOrderOpen() {
+        OrderManager manager = activeBid(10);
+
+        manager.onExecution(
+                OrderManager.Side.BID,
+                BID_ID,
+                3);
+
+        assertEquals(
+                OrderManager.State.ACTIVE,
+                manager.state(OrderManager.Side.BID));
+
+        assertEquals(
+                7,
+                manager.remainingQty(OrderManager.Side.BID));
+    }
+
+    @Test
+    void multiplePartialFillsAccumulate() {
+        OrderManager manager = activeBid(10);
+
+        manager.onExecution(
+                OrderManager.Side.BID,
+                BID_ID,
+                3);
+
+        manager.onExecution(
+                OrderManager.Side.BID,
+                BID_ID,
+                4);
+
+        assertEquals(
+                OrderManager.State.ACTIVE,
+                manager.state(OrderManager.Side.BID));
+
+        assertEquals(
+                3,
+                manager.remainingQty(OrderManager.Side.BID));
+    }
+
+    @Test
+    void fullFillClearsActiveOrder() {
+        OrderManager manager = activeBid(10);
+
+        manager.onExecution(
+                OrderManager.Side.BID,
+                BID_ID,
+                10);
+
+        assertEmptyBid(manager);
+    }
+
+    @Test
+    void fullFillAfterPartialsClearsOrder() {
+        OrderManager manager = activeBid(10);
+
+        manager.onExecution(
+                OrderManager.Side.BID,
+                BID_ID,
+                3);
+
+        manager.onExecution(
+                OrderManager.Side.BID,
+                BID_ID,
+                7);
+
+        assertEmptyBid(manager);
+    }
+
+    @Test
+    void partialFillDuringPendingAddKeepsPendingAdd() {
+        OrderManager manager = pendingBid(10);
+
+        manager.onExecution(
+                OrderManager.Side.BID,
+                BID_ID,
+                3);
+
+        assertEquals(
+                OrderManager.State.PENDING_ADD,
+                manager.state(OrderManager.Side.BID));
+
+        assertEquals(
+                7,
+                manager.remainingQty(OrderManager.Side.BID));
+    }
+
+    @Test
+    void fullFillDuringPendingAddIsTerminal() {
+        OrderManager manager = pendingBid(10);
+
+        manager.onExecution(
+                OrderManager.Side.BID,
+                BID_ID,
+                10);
+
+        assertEmptyBid(manager);
+    }
+
+    @Test
+    void partialFillDuringPendingCancelKeepsCancelPending() {
+        OrderManager manager = activeBid(10);
+
+        manager.beginCancel(
+                OrderManager.Side.BID,
+                BID_ID);
+
+        manager.onExecution(
+                OrderManager.Side.BID,
+                BID_ID,
+                4);
+
+        assertEquals(
+                OrderManager.State.PENDING_CANCEL,
+                manager.state(OrderManager.Side.BID));
+
+        assertEquals(
+                6,
+                manager.remainingQty(OrderManager.Side.BID));
+    }
+
+    @Test
+    void fullFillDuringPendingCancelIsTerminal() {
+        OrderManager manager = activeBid(10);
+
+        manager.beginCancel(
+                OrderManager.Side.BID,
+                BID_ID);
+
+        manager.onExecution(
+                OrderManager.Side.BID,
+                BID_ID,
+                10);
+
+        assertEmptyBid(manager);
+    }
+
+    @Test
+    void partialFillDoesNotResolveUnknown() {
+        OrderManager manager = pendingBid(10);
+
+        manager.markRequestUncertain(
+                OrderManager.Side.BID,
+                BID_ID);
+
+        manager.onExecution(
+                OrderManager.Side.BID,
+                BID_ID,
+                4);
+
+        assertEquals(
+                OrderManager.State.UNKNOWN,
+                manager.state(OrderManager.Side.BID));
+
+        assertEquals(
+                6,
+                manager.remainingQty(OrderManager.Side.BID));
+
+        assertFalse(manager.isReconciled());
+    }
+
+    @Test
+    void fullFillResolvesUnknownToEmpty() {
+        OrderManager manager = pendingBid(10);
+
+        manager.markRequestUncertain(
+                OrderManager.Side.BID,
+                BID_ID);
+
+        manager.onExecution(
+                OrderManager.Side.BID,
+                BID_ID,
+                10);
+
+        assertEmptyBid(manager);
+        assertTrue(manager.isReconciled());
+    }
+
+    @Test
+    void cancellationClearsActiveOrder() {
+        OrderManager manager = activeBid(10);
+
+        manager.onCancelled(
+                OrderManager.Side.BID,
+                BID_ID);
+
+        assertEmptyBid(manager);
+    }
+
+    @Test
+    void cancellationClearsPendingCancel() {
+        OrderManager manager = activeBid(10);
+
+        manager.beginCancel(
+                OrderManager.Side.BID,
+                BID_ID);
+
+        manager.onCancelled(
+                OrderManager.Side.BID,
+                BID_ID);
+
+        assertEmptyBid(manager);
+    }
+
+    @Test
+    void cancellationResolvesUnknown() {
+        OrderManager manager = activeBid(10);
+
+        manager.beginCancel(
+                OrderManager.Side.BID,
+                BID_ID);
+
+        manager.markRequestUncertain(
+                OrderManager.Side.BID,
+                BID_ID);
+
+        manager.onCancelled(
+                OrderManager.Side.BID,
+                BID_ID);
+
+        assertEmptyBid(manager);
+        assertTrue(manager.isReconciled());
+    }
+
+    @Test
+    void cancelRequestedWhileUnknownRemainsUnknown() {
+        OrderManager manager = pendingBid(10);
+
+        manager.markRequestUncertain(
+                OrderManager.Side.BID,
+                BID_ID);
+
+        manager.beginCancel(
+                OrderManager.Side.BID,
+                BID_ID);
+
+        assertEquals(
+                OrderManager.State.UNKNOWN,
+                manager.state(OrderManager.Side.BID));
+
+        assertFalse(manager.isReconciled());
+    }
+
+    @Test
+    void fullFillAfterUnknownCancelRequestClearsOrder() {
+        OrderManager manager = pendingBid(10);
+
+        manager.markRequestUncertain(
+                OrderManager.Side.BID,
+                BID_ID);
+
+        manager.beginCancel(
+                OrderManager.Side.BID,
+                BID_ID);
+
+        manager.onExecution(
+                OrderManager.Side.BID,
+                BID_ID,
+                10);
+
+        assertEmptyBid(manager);
+    }
+
+    @Test
+    void lateRestingAfterFullFillIsIgnored() {
+        OrderManager manager = activeBid(10);
+
+        manager.onExecution(
+                OrderManager.Side.BID,
+                BID_ID,
+                10);
+
+        manager.onResting(
+                OrderManager.Side.BID,
+                BID_ID);
+
+        assertEmptyBid(manager);
+    }
+
+    @Test
+    void lateCancelAfterFullFillIsIgnored() {
+        OrderManager manager = activeBid(10);
+
+        manager.onExecution(
+                OrderManager.Side.BID,
+                BID_ID,
+                10);
+
+        manager.onCancelled(
+                OrderManager.Side.BID,
+                BID_ID);
+
+        assertEmptyBid(manager);
+    }
+
+    @Test
+    void lateExecutionAfterTerminalDoesNotReopenOrder() {
+        OrderManager manager = activeBid(10);
+
+        manager.onCancelled(
+                OrderManager.Side.BID,
+                BID_ID);
+
+        manager.onExecution(
+                OrderManager.Side.BID,
+                BID_ID,
+                1);
+
+        assertEmptyBid(manager);
+    }
+
+    @Test
+    void staleEventForDifferentOrderDoesNotAffectCurrentOrder() {
+        OrderManager manager = activeBid(10);
+
+        manager.onExecution(
+                OrderManager.Side.BID,
+                "OLD00001",
+                5);
+
+        manager.onResting(
+                OrderManager.Side.BID,
+                "OLD00001");
+
+        manager.onCancelled(
+                OrderManager.Side.BID,
+                "OLD00001");
+
+        assertEquals(
+                OrderManager.State.ACTIVE,
+                manager.state(OrderManager.Side.BID));
+
+        assertEquals(
+                BID_ID,
+                manager.orderId(OrderManager.Side.BID));
+
+        assertEquals(
+                10,
+                manager.remainingQty(OrderManager.Side.BID));
+    }
+
+    @Test
+    void overfillIsRejectedWithoutMutation() {
+        OrderManager manager = activeBid(10);
+
+        manager.onExecution(
+                OrderManager.Side.BID,
+                BID_ID,
+                7);
+
+        assertThrows(
+                IllegalStateException.class,
+                () -> manager.onExecution(
+                        OrderManager.Side.BID,
+                        BID_ID,
+                        4));
+
+        assertEquals(
+                OrderManager.State.ACTIVE,
+                manager.state(OrderManager.Side.BID));
+
+        assertEquals(
+                3,
+                manager.remainingQty(OrderManager.Side.BID));
+    }
+
+    @Test
+    void nonPositiveExecutionQuantityIsRejected() {
+        OrderManager manager = activeBid(10);
+
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> manager.onExecution(
+                        OrderManager.Side.BID,
+                        BID_ID,
+                        0));
+
+        assertEquals(
+                10,
+                manager.remainingQty(OrderManager.Side.BID));
+    }
+
+    @Test
+    void nonPositiveAddQuantityIsRejected() {
+        OrderManager manager = new OrderManager();
+
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> manager.beginAdd(
+                        OrderManager.Side.BID,
+                        BID_ID,
+                        0));
 
         assertEquals(
                 OrderManager.State.EMPTY,
-                manager.state(OrderManager.Side.ASK));
-
-        assertNull(
-                manager.orderId(OrderManager.Side.ASK));
+                manager.state(OrderManager.Side.BID));
     }
 
     @Test
-    void bidAndAskOperateIndependently() {
-        OrderManager manager = new OrderManager();
-
-        manager.beginAdd(
-                OrderManager.Side.BID,
-                "BID00001");
-
-        manager.beginAdd(
-                OrderManager.Side.ASK,
-                "ASK00001");
-
-        manager.markActive(
-                OrderManager.Side.BID,
-                "BID00001");
-
-        assertEquals(
-                OrderManager.State.ACTIVE,
-                manager.state(OrderManager.Side.BID));
-
-        assertEquals(
-                OrderManager.State.PENDING_ADD,
-                manager.state(OrderManager.Side.ASK));
-
-        manager.markActive(
-                OrderManager.Side.ASK,
-                "ASK00001");
-
-        assertEquals(
-                OrderManager.State.ACTIVE,
-                manager.state(OrderManager.Side.BID));
-
-        assertEquals(
-                OrderManager.State.ACTIVE,
-                manager.state(OrderManager.Side.ASK));
-    }
-
-    @Test
-    void occupiedSlotRejectsSecondBeginAdd() {
-        OrderManager manager = new OrderManager();
-
-        manager.beginAdd(
-                OrderManager.Side.BID,
-                "BID00001");
+    void occupiedSlotRejectsAnotherAdd() {
+        OrderManager manager = pendingBid(10);
 
         assertThrows(
                 IllegalStateException.class,
                 () -> manager.beginAdd(
                         OrderManager.Side.BID,
-                        "BID00002"));
+                        "BID00002",
+                        5));
 
         assertEquals(
-                OrderManager.State.PENDING_ADD,
-                manager.state(OrderManager.Side.BID));
-
-        assertEquals(
-                "BID00001",
+                BID_ID,
                 manager.orderId(OrderManager.Side.BID));
+
+        assertEquals(
+                10,
+                manager.remainingQty(OrderManager.Side.BID));
     }
 
     @Test
-    void pendingAddCanBecomeActive() {
+    void eitherUnknownBlocksReconciliation() {
         OrderManager manager = new OrderManager();
 
         manager.beginAdd(
                 OrderManager.Side.BID,
-                "BID00001");
-
-        manager.markActive(
-                OrderManager.Side.BID,
-                "BID00001");
-
-        assertEquals(
-                OrderManager.State.ACTIVE,
-                manager.state(OrderManager.Side.BID));
-    }
-
-    @Test
-    void activeCanBeginCancel() {
-        OrderManager manager = activeBid();
-
-        manager.beginCancel(
-                OrderManager.Side.BID,
-                "BID00001");
-
-        assertEquals(
-                OrderManager.State.PENDING_CANCEL,
-                manager.state(OrderManager.Side.BID));
-    }
-
-    @Test
-    void pendingAddCanBecomeUnknown() {
-        OrderManager manager = new OrderManager();
-
-        manager.beginAdd(
-                OrderManager.Side.BID,
-                "BID00001");
-
-        manager.markUnknown(
-                OrderManager.Side.BID,
-                "BID00001");
-
-        assertEquals(
-                OrderManager.State.UNKNOWN,
-                manager.state(OrderManager.Side.BID));
-
-        assertFalse(manager.isReconciled());
-    }
-
-    @Test
-    void activeCanBecomeUnknown() {
-        OrderManager manager = activeBid();
-
-        manager.markUnknown(
-                OrderManager.Side.BID,
-                "BID00001");
-
-        assertEquals(
-                OrderManager.State.UNKNOWN,
-                manager.state(OrderManager.Side.BID));
-    }
-
-    @Test
-    void pendingCancelCanBecomeUnknown() {
-        OrderManager manager = activeBid();
-
-        manager.beginCancel(
-                OrderManager.Side.BID,
-                "BID00001");
-
-        manager.markUnknown(
-                OrderManager.Side.BID,
-                "BID00001");
-
-        assertEquals(
-                OrderManager.State.UNKNOWN,
-                manager.state(OrderManager.Side.BID));
-    }
-
-    @Test
-    void unknownCanRemainUnknown() {
-        OrderManager manager = activeBid();
-
-        manager.markUnknown(
-                OrderManager.Side.BID,
-                "BID00001");
-
-        manager.markUnknown(
-                OrderManager.Side.BID,
-                "BID00001");
-
-        assertEquals(
-                OrderManager.State.UNKNOWN,
-                manager.state(OrderManager.Side.BID));
-    }
-
-    @Test
-    void unknownCanBecomeActive() {
-        OrderManager manager = activeBid();
-
-        manager.markUnknown(
-                OrderManager.Side.BID,
-                "BID00001");
-
-        manager.markActive(
-                OrderManager.Side.BID,
-                "BID00001");
-
-        assertEquals(
-                OrderManager.State.ACTIVE,
-                manager.state(OrderManager.Side.BID));
-
-        assertTrue(manager.isReconciled());
-    }
-
-    @Test
-    void unknownCanBeginCancel() {
-        OrderManager manager = activeBid();
-
-        manager.markUnknown(
-                OrderManager.Side.BID,
-                "BID00001");
-
-        manager.beginCancel(
-                OrderManager.Side.BID,
-                "BID00001");
-
-        assertEquals(
-                OrderManager.State.PENDING_CANCEL,
-                manager.state(OrderManager.Side.BID));
-
-        assertTrue(manager.isReconciled());
-    }
-
-    @Test
-    void eitherUnknownMakesManagerUnreconciled() {
-        OrderManager manager = new OrderManager();
-
-        manager.beginAdd(
-                OrderManager.Side.BID,
-                "BID00001");
+                BID_ID,
+                10);
 
         manager.beginAdd(
                 OrderManager.Side.ASK,
-                "ASK00001");
+                ASK_ID,
+                10);
 
-        manager.markUnknown(
+        manager.markRequestUncertain(
                 OrderManager.Side.BID,
-                "BID00001");
+                BID_ID);
 
         assertFalse(manager.isReconciled());
 
-        manager.markUnknown(
-                OrderManager.Side.ASK,
-                "ASK00001");
-
-        assertFalse(manager.isReconciled());
-
-        manager.markTerminal(
+        manager.onResting(
                 OrderManager.Side.BID,
-                "BID00001");
-
-        assertFalse(manager.isReconciled());
-
-        manager.markTerminal(
-                OrderManager.Side.ASK,
-                "ASK00001");
+                BID_ID);
 
         assertTrue(manager.isReconciled());
     }
 
-    @Test
-    void terminalFromPendingAddClearsSlot() {
+    private static OrderManager pendingBid(int quantity) {
         OrderManager manager = new OrderManager();
 
         manager.beginAdd(
                 OrderManager.Side.BID,
-                "BID00001");
+                BID_ID,
+                quantity);
 
-        manager.markTerminal(
-                OrderManager.Side.BID,
-                "BID00001");
-
-        assertEmptyBid(manager);
+        return manager;
     }
 
-    @Test
-    void terminalFromActiveClearsSlot() {
-        OrderManager manager = activeBid();
+    private static OrderManager activeBid(int quantity) {
+        OrderManager manager = pendingBid(quantity);
 
-        manager.markTerminal(
+        manager.onResting(
                 OrderManager.Side.BID,
-                "BID00001");
-
-        assertEmptyBid(manager);
-    }
-
-    @Test
-    void terminalFromPendingCancelClearsSlot() {
-        OrderManager manager = activeBid();
-
-        manager.beginCancel(
-                OrderManager.Side.BID,
-                "BID00001");
-
-        manager.markTerminal(
-                OrderManager.Side.BID,
-                "BID00001");
-
-        assertEmptyBid(manager);
-    }
-
-    @Test
-    void terminalFromUnknownClearsSlot() {
-        OrderManager manager = activeBid();
-
-        manager.markUnknown(
-                OrderManager.Side.BID,
-                "BID00001");
-
-        manager.markTerminal(
-                OrderManager.Side.BID,
-                "BID00001");
-
-        assertEmptyBid(manager);
-    }
-
-    @Test
-    void wrongOrderIdIsRejectedWithoutMutation() {
-        OrderManager manager = activeBid();
-
-        assertThrows(
-                IllegalStateException.class,
-                () -> manager.beginCancel(
-                        OrderManager.Side.BID,
-                        "WRONG001"));
-
-        assertEquals(
-                OrderManager.State.ACTIVE,
-                manager.state(OrderManager.Side.BID));
-
-        assertEquals(
-                "BID00001",
-                manager.orderId(OrderManager.Side.BID));
-    }
-
-    @Test
-    void invalidTransitionDoesNotMutateSlot() {
-        OrderManager manager = new OrderManager();
-
-        manager.beginAdd(
-                OrderManager.Side.BID,
-                "BID00001");
-
-        assertThrows(
-                IllegalStateException.class,
-                () -> manager.beginCancel(
-                        OrderManager.Side.BID,
-                        "BID00001"));
-
-        assertEquals(
-                OrderManager.State.PENDING_ADD,
-                manager.state(OrderManager.Side.BID));
-
-        assertEquals(
-                "BID00001",
-                manager.orderId(OrderManager.Side.BID));
-    }
-
-    @Test
-    void nullSideIsRejected() {
-        OrderManager manager = new OrderManager();
-
-        assertThrows(
-                IllegalArgumentException.class,
-                () -> manager.beginAdd(
-                        null,
-                        "BID00001"));
-    }
-
-    @Test
-    void nullAndBlankOrderIdsAreRejected() {
-        OrderManager manager = new OrderManager();
-
-        assertThrows(
-                IllegalArgumentException.class,
-                () -> manager.beginAdd(
-                        OrderManager.Side.BID,
-                        null));
-
-        assertThrows(
-                IllegalArgumentException.class,
-                () -> manager.beginAdd(
-                        OrderManager.Side.BID,
-                        "   "));
-    }
-
-    @Test
-    void acceptedAddRemainsPendingUntilLifecycleEvidence() {
-        OrderManager manager = new OrderManager();
-
-        manager.beginAdd(
-                OrderManager.Side.BID,
-                "BID00001");
-
-        manager.markAddAccepted(
-                OrderManager.Side.BID,
-                "BID00001");
-
-        assertEquals(
-                OrderManager.State.PENDING_ADD,
-                manager.state(OrderManager.Side.BID));
-
-        assertEquals(
-                "BID00001",
-                manager.orderId(OrderManager.Side.BID));
-
-        assertTrue(manager.isReconciled());
-    }
-
-    @Test
-    void rejectedAddBecomesUnknown() {
-        OrderManager manager = new OrderManager();
-
-        manager.beginAdd(
-                OrderManager.Side.BID,
-                "BID00001");
-
-        manager.markAddRejected(
-                OrderManager.Side.BID,
-                "BID00001");
-
-        assertEquals(
-                OrderManager.State.UNKNOWN,
-                manager.state(OrderManager.Side.BID));
-
-        assertEquals(
-                "BID00001",
-                manager.orderId(OrderManager.Side.BID));
-
-        assertFalse(manager.isReconciled());
-    }
-
-    @Test
-    void addTimeoutBecomesUnknown() {
-        OrderManager manager = new OrderManager();
-
-        manager.beginAdd(
-                OrderManager.Side.BID,
-                "BID00001");
-
-        manager.markAddTimeout(
-                OrderManager.Side.BID,
-                "BID00001");
-
-        assertEquals(
-                OrderManager.State.UNKNOWN,
-                manager.state(OrderManager.Side.BID));
-
-        assertEquals(
-                "BID00001",
-                manager.orderId(OrderManager.Side.BID));
-
-        assertFalse(manager.isReconciled());
-    }
-
-    @Test
-    void acceptedCancelRemainsPendingUntilLifecycleEvidence() {
-        OrderManager manager = activeBid();
-
-        manager.beginCancel(
-                OrderManager.Side.BID,
-                "BID00001");
-
-        manager.markCancelAccepted(
-                OrderManager.Side.BID,
-                "BID00001");
-
-        assertEquals(
-                OrderManager.State.PENDING_CANCEL,
-                manager.state(OrderManager.Side.BID));
-
-        assertEquals(
-                "BID00001",
-                manager.orderId(OrderManager.Side.BID));
-
-        assertTrue(manager.isReconciled());
-    }
-
-    @Test
-    void rejectedCancelBecomesUnknown() {
-        OrderManager manager = activeBid();
-
-        manager.beginCancel(
-                OrderManager.Side.BID,
-                "BID00001");
-
-        manager.markCancelRejected(
-                OrderManager.Side.BID,
-                "BID00001");
-
-        assertEquals(
-                OrderManager.State.UNKNOWN,
-                manager.state(OrderManager.Side.BID));
-
-        assertEquals(
-                "BID00001",
-                manager.orderId(OrderManager.Side.BID));
-
-        assertFalse(manager.isReconciled());
-    }
-
-    @Test
-    void cancelTimeoutBecomesUnknown() {
-        OrderManager manager = activeBid();
-
-        manager.beginCancel(
-                OrderManager.Side.BID,
-                "BID00001");
-
-        manager.markCancelTimeout(
-                OrderManager.Side.BID,
-                "BID00001");
-
-        assertEquals(
-                OrderManager.State.UNKNOWN,
-                manager.state(OrderManager.Side.BID));
-
-        assertEquals(
-                "BID00001",
-                manager.orderId(OrderManager.Side.BID));
-
-        assertFalse(manager.isReconciled());
-    }
-
-    @Test
-    void addOutcomeWithWrongOrderIdDoesNotMutateSlot() {
-        OrderManager manager = new OrderManager();
-
-        manager.beginAdd(
-                OrderManager.Side.BID,
-                "BID00001");
-
-        assertThrows(
-                IllegalStateException.class,
-                () -> manager.markAddTimeout(
-                        OrderManager.Side.BID,
-                        "WRONG001"));
-
-        assertEquals(
-                OrderManager.State.PENDING_ADD,
-                manager.state(OrderManager.Side.BID));
-
-        assertEquals(
-                "BID00001",
-                manager.orderId(OrderManager.Side.BID));
-    }
-
-    @Test
-    void cancelOutcomeWithWrongOrderIdDoesNotMutateSlot() {
-        OrderManager manager = activeBid();
-
-        manager.beginCancel(
-                OrderManager.Side.BID,
-                "BID00001");
-
-        assertThrows(
-                IllegalStateException.class,
-                () -> manager.markCancelRejected(
-                        OrderManager.Side.BID,
-                        "WRONG001"));
-
-        assertEquals(
-                OrderManager.State.PENDING_CANCEL,
-                manager.state(OrderManager.Side.BID));
-
-        assertEquals(
-                "BID00001",
-                manager.orderId(OrderManager.Side.BID));
-    }
-
-    @Test
-    void addOutcomeRequiresPendingAddState() {
-        OrderManager manager = activeBid();
-
-        assertThrows(
-                IllegalStateException.class,
-                () -> manager.markAddAccepted(
-                        OrderManager.Side.BID,
-                        "BID00001"));
-
-        assertEquals(
-                OrderManager.State.ACTIVE,
-                manager.state(OrderManager.Side.BID));
-    }
-
-    @Test
-    void cancelOutcomeRequiresPendingCancelState() {
-        OrderManager manager = activeBid();
-
-        assertThrows(
-                IllegalStateException.class,
-                () -> manager.markCancelAccepted(
-                        OrderManager.Side.BID,
-                        "BID00001"));
-
-        assertEquals(
-                OrderManager.State.ACTIVE,
-                manager.state(OrderManager.Side.BID));
-    }
-
-    private static OrderManager activeBid() {
-        OrderManager manager = new OrderManager();
-
-        manager.beginAdd(
-                OrderManager.Side.BID,
-                "BID00001");
-
-        manager.markActive(
-                OrderManager.Side.BID,
-                "BID00001");
+                BID_ID);
 
         return manager;
     }
@@ -645,5 +639,9 @@ class OrderManagerTest {
 
         assertNull(
                 manager.orderId(OrderManager.Side.BID));
+
+        assertEquals(
+                0,
+                manager.remainingQty(OrderManager.Side.BID));
     }
 }
