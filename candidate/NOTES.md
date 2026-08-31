@@ -1,169 +1,142 @@
-## Job 1.3 — Partial-fill ordering and quantity semantics probe
+## Job 1.3 investigation — JetStream own-sender lifecycle replay
 
-### Question
+### Purpose
 
-Before wiring live Quoter market-data events into `OrderManager`, verify the exchange
-semantics that could otherwise create quantity or lifecycle races:
+Determine whether sender-specific Quoter lifecycle history can be replayed from
+JetStream quickly and deterministically enough to support UNKNOWN reconciliation.
 
-- Does E/T `volume` mean actual matched quantity or incoming requested quantity?
-- Is `A.volume` original submitted quantity or remaining resting quantity?
-- Does an immediately fully-filled L order still emit A?
-- Can one incoming order produce multiple execution records?
-- Can A/E/T/C timestamps be used as lifecycle sequence?
-- If our resting remainder is smaller than the contra request, what quantity is reported
-  for our execution?
-
-### Probe
-
-Source:
-- `candidate/probes/PartialFillOrderingProbe.java`
-
-Runtime:
-- feed `AAH6`
-- tracked sender `PFPROBE1`
-- contra sender `PFPROBE2`
-- tick size `1`
-
-The probe used sender-specific market-data subscriptions and separately recorded local
-callback receipt sequence and exchange event timestamp.
-
-### Controlled observations
-
-#### Single partial
-
-Contra SELL 3 rested, then tracked BUY L 10 crossed it.
-
-Observed:
-```text
-reply: EXCHANGE Y 3
-A PFPROBE1:... B 10 ...
-E ... volume=3 ...
-T ... volume=3 ...
-```
-
-The tracked A reported `10`, while the actual execution reported `3`.
-
-Later external orders filled the remaining tracked quantity as separate E events
-(`1` and `6`). This confirms the remainder continued resting and remained executable.
-
-Conclusion:
-- `A.volume` is original submitted quantity in the observed runtime, not current
-  remaining quantity.
-- E/T volume is actual matched quantity.
-- remaining quantity must be calculated from requested quantity minus accumulated
-  deduplicated E/T quantities.
-
-#### Immediate full fill
-
-Contra SELL 10 rested, then tracked BUY L 10 crossed it.
-
-Observed:
-```text
-reply: EXCHANGE Y 10
-A ... volume=10
-E ... volume=10
-T ... volume=10
-C ...
-```
-
-Conclusion:
-- An L order can emit A even when it immediately fills fully.
-- A therefore cannot mean "this full quantity is currently resting".
-- Full E/T is terminal lifecycle evidence; later A/C must not resurrect a terminal order.
-
-#### Multiple partial matches
-
-Two contra SELL orders of 3 and 2 rested; tracked BUY L 10 crossed both.
-
-Observed:
-```text
-reply: EXCHANGE Y 5
-A ... volume=10
-E/T ... volume=3 matchId=778333
-E/T ... volume=2 matchId=778334
-```
-
-Conclusion:
-- One order can generate multiple execution records.
-- Each deduplicated E/T quantity must be accumulated independently.
-- Do not assume one request produces one execution callback.
-
-#### Contra quantity larger than our resting quantity
-
-Tracked SELL L 1 rested. Contra BUY L 5 crossed it.
-
-Observed:
-```text
-contra reply: EXCHANGE Y 1
-tracked E ... volume=1
-contra T ... volume=1
-tracked C ...
-```
-
-The contra remainder then remained on the exchange and later traded `4` against another
-participant.
-
-Conclusion:
-- The execution reported for our order is the quantity actually matched to our order.
-- Our remaining `1` becomes FULL/EMPTY; the contra's extra `4` is not an overfill of our
-  order and is handled by the exchange.
-- `newFilled > requestedQty` remains an invariant violation, not a normal matching case.
-
-### Ordering / timestamp finding
-
-In the observed cases, local callback receipt order was A before E/T and then C where
-applicable. However, A/E/T/C created by the same matching action often shared the exact
-same exchange timestamp.
-
-Conclusion:
-- exchange timestamp is not a lifecycle sequence number.
-- production correctness must not depend on timestamp ordering.
-- lifecycle must converge correctly even if callback delivery order changes.
-
-### Probe limitation
-
-The intended `CASE1_NO_FILL` was not a controlled no-fill result: external `MOVER001`
-traded the entire resting order shortly after A. It must not be cited as proof of
-long-lived no-fill behavior.
-
-The active simulator also produced transient empty-side BBO updates, which
-`QuoterIntegration` correctly rejected as invalid BBO state. Those warnings do not alter
-the execution conclusions above.
-
-### Frozen lifecycle consequences
+Probe source:
 
 ```text
-remainingQty = requestedQty - accumulated deduplicated E/T qty
-
-A:
-lifecycle evidence only
-never quantity authority
-
-partial E/T:
-preserve PENDING_ADD / ACTIVE / PENDING_CANCEL / UNKNOWN
-
-full E/T:
-EMPTY
-
-same-current C:
-EMPTY
-
-late old-order A/E/T/C:
-ignore for lifecycle; never reopen
+candidate/probes/JetStreamReplayProbe.java
 ```
 
-Position/exposure accounting remains separate:
-- deduplicate E/T first
-- account the authoritative execution
-- then apply lifecycle matching
-- lifecycle ignore must never cause a legitimate execution to be discarded
+The probe is read-only. It does not publish orders, create consumers, purge data,
+or mutate production state.
 
-### Validation around the probe
+### EX_MD retention observed
 
-Before the probe:
-- Maven package: BUILD SUCCESS
-- full Java suite: 84 tests, 0 failures/errors/skipped
-- `OrderManagerTest`: 31 tests, 0 failures/errors/skipped
+The exchange market-data stream was:
 
-The probe source is retained as submission evidence; generated `target/`, `out/`, jar,
-and class files remain non-source artifacts and are not submission evidence.
+```text
+name=EX_MD
+subjects=["ex.md.>","ex.bbo.>"]
+retention=limits
+max_msgs=2000000
+storage=memory
+num_replicas=1
+discard=old
+```
+
+At the first replay attempt:
+
+```text
+firstSeq=30256541
+lastSeq=32256540
+```
+
+No `PFPROBE1` history remained. This was consistent with the stream-wide
+2,000,000-message retention limit; the older probe history had already been
+discarded.
+
+At the fresh replay run:
+
+```text
+firstSeq=31353612
+lastSeq=33353611
+firstTime=2026-08-31T21:45:57.744565477Z
+lastTime=2026-08-31T22:18:38.938364942Z
+```
+
+This represented roughly 32 minutes 41 seconds of retained EX_MD history at the
+observed simulator traffic rate. This is an observation, not a guaranteed
+production retention duration.
+
+### Fresh lifecycle generation
+
+`PartialFillOrderingProbe` was rerun to create new `PFPROBE1` history.
+
+Case 1 produced:
+
+```text
+A PFPROBE1:A473C001 S 10 537
+E TAKER001:63501890 PFPROBE1:A473C001 10 537 1128516 B
+C PFPROBE1:A473C001
+```
+
+Case 2 stopped intentionally because BBO was `536 / 537` with tick size `1`, so
+there was no safe inside-spread probe price. The safety guard prevented an
+uncontrolled experiment. Case 1 was sufficient to create fresh replayable
+lifecycle data.
+
+### Replay result
+
+Exact subject:
+
+```text
+ex.md.AAH6.PFPROBE1
+```
+
+Matching JetStream stream:
+
+```text
+EX_MD
+```
+
+Bounded retained PFPROBE1 window:
+
+```text
+snapshotFirstSeq=33233517
+snapshotLastSeq=33347852
+```
+
+The replay used JetStream stream sequence plus exact-subject filtering. Although
+the global stream sequence span exceeded 114,000 messages, only the 37 matching
+PFPROBE1 messages were returned.
+
+Measured results:
+
+```text
+pass1Count=37
+pass2Count=37
+
+pass1ElapsedMs=105.4834
+pass2ElapsedMs=57.5374
+
+pass1MaxLookupMs=8.0341
+pass2MaxLookupMs=6.3136
+
+sameSequenceAndPayload=true
+RESULT=REPLAYABLE
+```
+
+The two bounded passes returned identical sequence and payload data.
+
+### Engineering conclusions
+
+1. `EX_MD` retains sender-specific lifecycle A/E/T/C data and supports exact
+   subject-filtered replay.
+2. JetStream stream sequence is suitable as a bounded replay cursor.
+3. Each reconciliation attempt will own an independent cursor/window:
+   `floorSeq`, `highWaterSeq`, and current replay cursor. Do not use one mutable
+   global reconciliation cursor.
+4. A reconciliation attempt should snapshot a high-water sequence and replay
+   only the bounded sender-specific window required for that attempt.
+5. Replay may overlap live lifecycle delivery. Existing Quoter E/T dedup and
+   idempotent/late A/C lifecycle handling make overlap acceptable.
+6. Observed replay cost for 37 lifecycle events was approximately 58–105 ms.
+   Therefore replay escalation does not need to wait several seconds merely
+   because replay is expensive.
+7. Escalation times are maximum action deadlines, not minimum waiting periods.
+   Exact Cancel or replay may start earlier when evidence justifies it.
+8. Tentative V1 timing for later reconciliation-state-machine design:
+   request unresolved at ~1 s -> UNKNOWN; cancel escalation by ~1 s UNKNOWN
+   age; replay escalation by ~2 s UNKNOWN age; recovery check by ~4 s UNKNOWN
+   age. Transport-outage timing semantics remain intentionally deferred until
+   the reconciliation state machine is designed.
+9. Time alone never changes UNKNOWN to EMPTY.
+10. Quoter execution dedup protects one reconciliation/order epoch from repeated
+    E/T affecting `filledQty`. A whole-set `executionDedup.clear()` is allowed
+    only after the entire reconciliation epoch has completed safely,
+    pre-reconciliation orders are authoritatively resolved, routing is
+    serialized, and before new exposure is enabled.

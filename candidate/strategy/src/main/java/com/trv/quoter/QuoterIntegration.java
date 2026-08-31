@@ -19,6 +19,8 @@ public final class QuoterIntegration implements ConnectionListener {
         Logger.getLogger(QuoterIntegration.class.getName());
 
     private static final int MAX_EXECUTION_DEDUP_ENTRIES = 4096;
+    private static final long DEFAULT_ADD_REQUEST_TIMEOUT_MS = 1000L;
+    private static final long DEFAULT_CANCEL_REQUEST_TIMEOUT_MS = 1000L;
 
     private final String feed;
     private final String natsUrl;
@@ -30,6 +32,7 @@ public final class QuoterIntegration implements ConnectionListener {
     private Dispatcher dispatcher;
     private Metadata metadata;
     private RuntimeState runtimeState;
+    private OrderRequestClient orderRequestClient;
 
     private final Object bboRecoveryLock = new Object();
     private boolean liveBboSeen;
@@ -77,6 +80,13 @@ public final class QuoterIntegration implements ConnectionListener {
         Options options = new Options.Builder()
             .server(natsUrl)
             .connectionListener(this)
+            /*
+             * Order-entry requests must not be deliberately buffered across
+             * disconnect/reconnect and appear later after lifecycle trust was
+             * lost. requestAdd/requestCancel still re-check transport trust
+             * immediately before dispatch.
+             */
+            .reconnectBufferSize(0)
             .build();
 
         natsConnection = Nats.connect(options);
@@ -118,6 +128,32 @@ public final class QuoterIntegration implements ConnectionListener {
         subscriptionsReady = true;
         runtimeState.markConnected();
         recoverRetainedBbo();
+
+        orderRequestClient =
+            new OrderRequestClient(
+                sender,
+                feed,
+                metadata,
+                orderManager,
+                () -> runtimeState != null
+                    && runtimeState.isReady(),
+                this::isOrderRequestTransportTrusted,
+                (subject, payload, timeout) ->
+                    natsConnection
+                        .requestWithTimeout(
+                            subject,
+                            payload,
+                            timeout)
+                        .thenApply(
+                            message -> message.getData()),
+                Duration.ofMillis(
+                    readPositiveTimeoutMillis(
+                        "ADD_REQUEST_TIMEOUT_MS",
+                        DEFAULT_ADD_REQUEST_TIMEOUT_MS)),
+                Duration.ofMillis(
+                    readPositiveTimeoutMillis(
+                        "CANCEL_REQUEST_TIMEOUT_MS",
+                        DEFAULT_CANCEL_REQUEST_TIMEOUT_MS)));
     }
 
     private void recoverRetainedBbo() {
@@ -411,14 +447,96 @@ public final class QuoterIntegration implements ConnectionListener {
         return orderManager;
     }
 
+    /*
+     * Foundation request primitive only.
+     * Profitability and inventory policy are intentionally deferred.
+     */
+    public void requestAdd(
+            OrderManager.Side side,
+            String orderId,
+            int quantity,
+            long price) {
+
+        requireOrderRequestClient()
+            .requestAdd(
+                side,
+                orderId,
+                quantity,
+                price);
+    }
+
+    /*
+     * Risk-reducing exact cancel. The request layer chooses the current id
+     * atomically from the shared OrderManager.
+     */
+    public void requestCancel(
+            OrderManager.Side side) {
+
+        requireOrderRequestClient()
+            .requestCancel(side);
+    }
+
     public Connection getConnection() {
         return natsConnection;
     }
 
     public void close() throws Exception {
+        if (orderRequestClient != null) {
+            orderRequestClient.close();
+        }
+
         if (natsConnection != null) {
             natsConnection.close();
         }
+    }
+
+    private OrderRequestClient requireOrderRequestClient() {
+        if (orderRequestClient == null) {
+            throw new IllegalStateException(
+                "order request client is not initialized");
+        }
+
+        return orderRequestClient;
+    }
+
+    private boolean isOrderRequestTransportTrusted() {
+        return subscriptionsReady
+            && natsConnection != null
+            && natsConnection.getStatus()
+                == Connection.Status.CONNECTED;
+    }
+
+    private long readPositiveTimeoutMillis(
+            String envName,
+            long defaultValue) {
+
+        String raw =
+            System.getenv(envName);
+
+        if (raw == null || raw.isBlank()) {
+            return defaultValue;
+        }
+
+        final long parsed;
+
+        try {
+            parsed =
+                Long.parseLong(
+                    raw.trim());
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException(
+                envName
+                    + " must be a positive integer milliseconds value",
+                e);
+        }
+
+        if (parsed <= 0L) {
+            throw new IllegalArgumentException(
+                envName
+                    + " must be positive");
+        }
+
+        return parsed;
     }
 
     private Metadata loadMetadata()

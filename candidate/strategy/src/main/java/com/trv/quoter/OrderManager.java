@@ -116,6 +116,48 @@ public class OrderManager {
                 "request uncertainty only applies to pending or unknown orders");
     }
 
+    /*
+     * Request-layer race-safe transition.
+     *
+     * A late N/exception/deadline must never override authoritative lifecycle
+     * evidence that already moved the same order to ACTIVE or EMPTY.
+     *
+     * Returns true only when this call changed a still-pending request to
+     * UNKNOWN. Old/different ids, terminal orders, ACTIVE orders and already
+     * UNKNOWN orders are no-ops.
+     */
+    public synchronized boolean markRequestUncertainIfPending(
+            Side side,
+            String orderId) {
+
+        validateInputs(side, orderId);
+
+        Slot slot = slot(side);
+
+        if (!isCurrentOrder(slot, orderId)) {
+            return false;
+        }
+
+        if (slot.state == State.PENDING_ADD) {
+            slot.state = State.UNKNOWN;
+            slot.unknownCause = UnknownCause.ADD_REQUEST;
+            return true;
+        }
+
+        if (slot.state == State.PENDING_CANCEL) {
+            slot.state = State.UNKNOWN;
+            slot.unknownCause = UnknownCause.CANCEL_REQUEST;
+            return true;
+        }
+
+        /*
+         * ACTIVE means authoritative A already won the race.
+         * UNKNOWN is already fail-closed.
+         * EMPTY cannot be current because isCurrentOrder() rejected it.
+         */
+        return false;
+    }
+
     public synchronized void markUnknown(
             Side side,
             String orderId) {
