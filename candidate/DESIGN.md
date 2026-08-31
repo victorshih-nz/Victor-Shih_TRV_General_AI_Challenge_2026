@@ -1,11 +1,11 @@
 # TRV Trading Desk — Agent Contract
 
-Use this file as the implementation contract attached to Copilot/Qwen.
+Use this file as the implementation contract for Copilot/Qwen.
 
 Source of truth:
-- `PROTOCOL.md` = external exchange protocol
+- `PROTOCOL.md` = exchange wire protocol
 - `DESIGN.md` = internal invariants
-- `NOTES.md` = probes/evidence/history
+- `NOTES.md` = evidence/probes/history
 
 Do not use old design drafts.
 
@@ -26,7 +26,20 @@ Capital preservation
 > delivery speed
 ```
 
-Minimum necessary implementation only. No speculative features or premature abstraction.
+Minimum necessary implementation. No speculative features, generic OMS, or premature abstraction.
+
+### Strategy tunability
+
+Keep architecture/safety stable while exposing about 10-15 centralized ENV-driven knobs
+for rapid simulation tuning.
+
+Typical knobs include quote size/edge/improvement, valuation/microprice/band/EWMA,
+Quoter/desk position limits, and Add/Cancel request timeouts.
+
+Tune economic defaults from simulation evidence; Add/Cancel timeouts start at `1000 ms`.
+Tuning must not change `timeout != failure`, one-order-per-side, cancel-before-replace,
+UNKNOWN exposure blocking, or desk-risk priority. Optimize safe fills + spread capture,
+not fill rate alone.
 
 ## 2. Desk position accounting
 
@@ -39,12 +52,12 @@ ex.md.<FEED>.<SENDER>
 ex.md.<FEED>.<HEDGER_SENDER>
 ```
 
-Do not combine with `ex.md.<FEED>.*` in production.
+Do not also subscribe to `ex.md.<FEED>.*` in production.
 
-Execution semantics:
+Execution:
 ```text
-T = tracked sender owns incoming/aggressor order
-E = tracked sender owns resting order
+T = tracked sender is aggressor
+E = tracked sender is resting owner
 
 T side = aggressorSide
 E side = opposite(aggressorSide)
@@ -53,422 +66,95 @@ Buy  = +qty
 Sell = -qty
 ```
 
-Both `T` and `E` are execution-bearing.
+Both `T` and `E` carry executions.
 
 ```text
-deskPosition
-= takerPosition
-+ quoterPosition
-+ hedgerPosition
+deskPosition = takerPosition + quoterPosition + hedgerPosition
 ```
 
-Never infer position from requested quantity or acknowledgements.
+Never infer position from requested quantity or `Y <n>`.
 
-Dedup key:
+Dedup executions using the full tracked-sender/event/order/match/qty/price/side tuple;
+never by `matchId` alone.
+
+## 3. Hedger / desk.risk
+
+Publish:
 ```text
-(trackedSender,eventType,eventTimestamp,matchId,
- incomingOrderId,restingOrderId,qty,price,aggressorSide)
+desk.risk.<FEED>
 ```
 
-Never deduplicate by `matchId` alone.
+Payload fields are timestamp, seq, feed, net position, soft/hard limits, state
+(`UNKNOWN|SAFE|CONTROLLED|EMERGENCY`) and hedge direction (`B|S|X`).
 
-## 3. Fill-and-Kill
+Rules: publish on state/position change + heartbeat <=250 ms; stale after >1000 ms
+without valid local receipt; use local monotonic freshness; seq is monotonic per trusted
+epoch and resets after trust loss; `B` buy reduces risk, `S` sell reduces risk, `X` none.
 
-Verified runtime:
-```text
-F may partially execute
-Y <n> = immediately traded volume
-unfilled remainder = cancelled
-```
-
-Position remains based on `T` / `E`.
+Hedger uses `F`. `Y <n>` is not position authority.
 
 After each hedge:
 ```text
 execution events
 -> recompute position
--> require current valid BBO
+-> require valid BBO
 -> decide next hedge
 ```
 
-## 4. Startup gate
+## 4. Runtime readiness
 
-Initial Hedger state:
+Conceptual states:
 ```text
-UNKNOWN
+READY
+WAITING
+FATAL
 ```
 
-Required sequence:
+`READY` requires trusted connection/subscription + valid trusted BBO + fresh valid
+risk != `UNKNOWN`. `WAITING` is recoverable fail-closed; `FATAL` requires restart.
+
+Order lifecycle does not belong in `RuntimeState`.
+
+Future quote gate:
 ```text
-1 connect NATS
-2 load/validate EX_META
-3 subscribe Taker execution feed
-4 subscribe Quoter execution feed
-5 subscribe Hedger execution feed
-6 subscribe core ex.bbo.<FEED>
-7 flush subscriptions
-8 retrieve retained latest BBO from EX_MD
-9 validate retained BBO
-10 establish initial desk position
-11 publish first valid non-UNKNOWN desk.risk
-12 allow Taker/Quoter exposure
+runtimeState.isReady() && orderManager.isReconciled()
 ```
 
-Before step 11:
+## 5. BBO and reconnect trust
+
+BBO is latest authoritative state, not a heartbeat.
+
+A valid BBO stays trusted while the connection remains trusted.
+Do not expire it merely because no newer BBO arrives.
+
+Invalidate BBO on newer empty/invalid/malformed authoritative state, connection trust
+loss, or incompatible metadata. Risk freshness remains heartbeat-based at 1000 ms.
+
+On disconnect:
+- stop quoting immediately
+- invalidate runtime trust
+- no Add/Cancel while disconnected
+- local order knowledge becomes untrusted for quoting
+
+On reconnect/resubscription: restore subscriptions, revalidate `EX_META`, recover
+retained/live BBO, require new valid risk, then reconcile own Quoter orders before
+new exposure.
+
+Metadata unavailable -> `WAITING`.
+Malformed/incompatible metadata -> `FATAL`.
+Lower risk seq is allowed after a new trust epoch.
+
+## 6. Quoter order lifecycle
+
+Exactly two logical quote slots:
 ```text
-Taker orders  = 0
-Quoter orders = 0
+BID
+ASK
 ```
 
-Timeout never causes `UNKNOWN -> SAFE`.
+Each slot holds at most one logical order.
 
-Prefer Taker startup gating outside legacy strategy logic.
-
-Legacy Taker changes only when:
-- controlled evidence proves a material defect, or
-- minimal integration is required for desk safety.
-
-## 5. desk.risk
-
-Subject:
-```text
-desk.risk.<FEED>
-```
-
-Payload:
-```text
-<ts_ns> <seq> <feed> <net_position> <soft_limit> <hard_limit> <state> <direction>
-```
-
-State:
-```text
-UNKNOWN | SAFE | CONTROLLED | EMERGENCY
-```
-
-Direction:
-```text
-B = buy reduces risk
-S = sell reduces risk
-X = no immediate hedge
-```
-
-Hedger publishes:
-- position change
-- state change
-- heartbeat <=250 ms
-
-`seq` is monotonic for one Hedger process lifetime.
-
-Quoter:
-- requires exactly 8 fields
-- rejects malformed/wrong-feed messages
-- freshness uses local monotonic receipt time
-- stale after 1000 ms without valid local receipt
-
-Remote `ts_ns` is diagnostic only.
-
-Stale risk or known NATS loss:
-```text
-UNKNOWN
-not ready
-```
-
-Sequence handling:
-```text
-trusted epoch:
-seq <= lastAcceptedSeq -> ignore
-
-after stale/disconnect/reconnect/startup reset:
-UNKNOWN
-clear seq baseline
-next valid message establishes new baseline
-```
-
-## 6. Quoter readiness
-
-Ready only when:
-```text
-valid config
-AND valid metadata
-AND NATS/subscriptions trusted
-AND valid trusted two-sided BBO
-AND valid fresh desk.risk
-AND desk.risk != UNKNOWN
-```
-
-Freshness:
-```text
-RISK_STALE_MS = 1000
-```
-
-BBO is latest-state data, not a heartbeat:
-- no age-based BBO expiry while NATS/subscription trust remains continuous,
-- no new BBO means the last valid BBO remains the latest trusted state,
-- a newly received empty, malformed, or otherwise invalid BBO invalidates the old
-  BBO and moves the Quoter to WAITING.
-
-Reconnect:
-```text
-invalidate old BBO
-invalidate old risk
-clear risk sequence epoch
-readiness=false
-wait for RESUBSCRIBED
-revalidate EX_META
-flush/synchronize subscriptions
-recover retained/live BBO
-require NEW desk.risk
-```
-
-## 7. BBO startup
-
-Verified:
-- core NATS receives future BBO updates
-- startup cannot rely on a new publication while book is unchanged
-- `EX_MD` retains `ex.bbo.>`
-- retained latest may be empty/invalid
-
-Startup:
-```text
-subscribe core ex.bbo.<FEED>
--> flush
--> get latest retained ex.bbo.<FEED> from EX_MD
--> validate
--> keep core subscription for live updates
-```
-
-Subscribe before retained lookup.
-
-Retained BBO establishes market state only if:
-```text
-present
-correct feed
-correctly formed
-two-sided valid
-```
-
-Otherwise remain not ready and wait for valid live BBO.
-
-Retained BBO age is not a readiness criterion. Under continuous trusted
-NATS/subscription state, the last valid BBO remains trusted until a newer
-authoritative BBO replaces or invalidates it.
-
-## 8. Metadata
-
-```text
-bucket = EX_META
-key = configured feed value from TAKER_FEED
-```
-
-Example:
-```text
-TAKER_FEED=AAH6 -> key AAH6
-```
-
-Existing `Metadata.parse(feed,payload)` matches supplied runtime data.
-
-Never use literal `"TAKER_FEED"` as KV key.
-
-## 9. Fair value
-
-```text
-mid = (bid + ask) / 2
-
-imbalance =
-(bidQty - askQty) / (bidQty + askQty)
-
-rawAdj =
-0.5 * (ask - bid) * imbalance
-
-bound =
-maxMicroPriceAdjustmentTicks * tickSize
-
-fair =
-mid + clamp(rawAdj,-bound,+bound)
-```
-
-Adjustment must remain bounded.
-
-## 10. Value and inventory
-
-```text
-cheapValue     = fairValue - valueBand
-expensiveValue = fairValue + valueBand
-```
-
-Value band = base + spread + EWMA movement, bounded.
-
-Signal:
-```text
-Cheap=-1
-Fair=0
-Expensive=+1
-```
-
-```text
-valuationAdjustmentTicks
-= -valuationSignal * maxValuationAdjustmentTicks
-```
-
-Reservation price:
-```text
-fairValue
-+ valuationAdjustment
-- inventoryAdjustment
-```
-
-Inventory risk overrides valuation opportunity.
-
-## 11. Risk priority
-
-```text
-EMERGENCY/HARD
-> CONTROLLED/SOFT
-> Minimum Edge
-> Valuation
-> Competitiveness
-```
-
-SAFE: normal quoting.
-
-Local hard long inventory:
-```text
-cancel/prohibit BID
-retain/improve risk-reducing ASK
-allow one-sided quoting
-```
-Short inventory: reverse sides.
-
-Desk CONTROLLED:
-```text
-direction=S -> suppress BID
-direction=B -> suppress ASK
-```
-
-Desk EMERGENCY:
-- cancel risk-increasing side
-- no new risk-increasing orders
-- allow one-sided quoting
-- risk reduction may override Minimum Edge
-
-Emergency cancel dispatch target: `<=100 ms`.
-
-Desk risk overrides local economics.
-
-## 12. Risk logging
-
-Log meaningful transitions only:
-- state change
-- suppression change
-- actual override
-- stale risk
-- disconnect/reconnect
-
-Include:
-```text
-state
-direction
-net position
-suppressed/overridden action
-reason
-```
-
-Do not log every heartbeat.
-
-## 13. Hedger states
-
-SAFE:
-```text
-abs(deskPosition) <= deskSoftLimit
-direction=X
-```
-
-CONTROLLED:
-```text
-deskSoftLimit < abs(deskPosition) < deskHardLimit
-```
-Goal: reduce toward safe boundary.
-
-Default hedge: Fill-and-Kill.
-
-Each hedge:
-- current valid BBO
-- bounded quantity
-- never exceed required reduction
-- wait for authoritative executions before next decision
-
-EMERGENCY:
-```text
-abs(deskPosition) >= deskHardLimit
-```
-Capital preservation dominates economics.
-
-## 14. Risk config
-
-Environment:
-```text
-QUOTER_SOFT_POS
-QUOTER_HARD_POS
-DESK_SOFT_POS
-DESK_HARD_POS
-```
-
-Validation:
-```text
-0 < QUOTER_SOFT_POS < QUOTER_HARD_POS
-0 < DESK_SOFT_POS   < DESK_HARD_POS
-QUOTER_HARD_POS <= DESK_HARD_POS
-```
-
-Effective limits must respect exchange limits.
-
-Invalid config = fail closed.
-
-## 15. NATS lifecycle
-
-Verified jnats 2.20.5 events:
-```text
-CONNECTED
-CLOSED
-DISCONNECTED
-RECONNECTED
-RESUBSCRIBED
-DISCOVERED_SERVERS
-LAME_DUCK
-```
-
-Policy:
-```text
-DISCONNECTED -> reset BBO/risk trust; not ready
-CLOSED       -> reset trust; fail closed
-LAME_DUCK    -> reset trust; not ready
-RECONNECTED  -> still not ready
-RESUBSCRIBED -> synchronization gate only
-```
-
-At every `RESUBSCRIBED` recovery:
-- re-read and validate `EX_META`,
-- flush/synchronize subscriptions,
-- restore connection trust,
-- recover the latest retained/live BBO,
-- require a new valid `desk.risk` message before READY.
-
-Do not use a disconnect-duration threshold. Only newly trusted runtime state
-restores readiness.
-
-## 16. Quoter order lifecycle
-
-V1 maintains exactly two logical quote slots:
-
-```text
-BID slot
-ASK slot
-```
-
-Each slot may contain at most one logical order.
-
-Minimal slot states:
-
+States:
 ```text
 EMPTY
 PENDING_ADD
@@ -477,152 +163,164 @@ PENDING_CANCEL
 UNKNOWN
 ```
 
-A terminal order is removed from the slot and the slot returns to `EMPTY`.
-Do not retain a separate long-lived `CLOSED` state in V1.
-
-### Slot invariant
-
-At all times:
-
+Terminal:
 ```text
-BID slot -> zero or one logical BID order
-ASK slot -> zero or one logical ASK order
+remove logical order -> EMPTY
 ```
 
-Do not stack multiple logical quotes on the same side.
+No long-lived `CLOSED`.
 
 ### Replacement invariant
 
-Cancel-before-replace is mandatory.
-
-Allowed sequence:
-
+Mandatory:
 ```text
 ACTIVE
 -> send cancel
 -> PENDING_CANCEL
--> confirm previous order terminal
+-> confirm old order terminal
 -> EMPTY
 -> submit replacement
 ```
 
-The following is explicitly prohibited:
-
+Prohibited:
 ```text
-cancel request sent
--> immediately submit replacement
+cancel request sent -> immediately submit replacement
 ```
 
-Sending a cancel request does not prove that the previous order is no longer live.
+Sending cancel does not prove the order is gone.
 
 ### Timeout semantics
 
-Timeout means that the operation outcome is unknown, not that the operation failed.
-
 ```text
-ADD request timeout
--> order outcome UNKNOWN
-
-CANCEL request timeout
--> order status UNKNOWN
+ADD timeout    -> UNKNOWN
+CANCEL timeout -> UNKNOWN
 ```
 
-Never infer from timeout that:
+Timeout means outcome unknown, not failure.
 
-```text
-ADD was rejected
-CANCEL succeeded
-CANCEL failed
-order cannot still fill
-```
+Never infer timeout means Add rejected, Cancel succeeded/failed, or the order cannot
+still fill.
 
-An unresolved `UNKNOWN` order blocks new Quoter exposure until reconciliation
-establishes a safe terminal state.
+Any unresolved `UNKNOWN` blocks all new Quoter exposure.
+Never blindly retry Add with a new order id after Add timeout.
 
-Do not blindly resend an Add using a new order id after an Add timeout.
-
-### Request timeout configuration
-
-Different request types use separate configurable timeout variables.
-
-Initial V1 defaults:
-
+Defaults:
 ```text
 ADD_REQUEST_TIMEOUT_MS    = 1000
 CANCEL_REQUEST_TIMEOUT_MS = 1000
 ```
 
-The numeric values are tuning/configuration values. They may be adjusted from
-measured evidence without changing the lifecycle rule:
-
-```text
-timeout != failure
-```
-
-Emergency cancellation uses a separate deadline:
-
+Emergency cancel dispatch target:
 ```text
 EMERGENCY_CANCEL_DISPATCH_TARGET_MS = 100
 ```
 
-This is a dispatch target/SLA, not an operation timeout. Missing the target does
-not permit cancellation to be abandoned.
+This is an SLA, not request timeout. Missing it does not permit abandoning cancellation.
 
-### Quoting gate
-
-Future order-entry integration must enforce:
-
+Fills may still arrive while:
 ```text
-canQuote
-=
-runtimeState.isReady()
-AND orderManager.isReconciled()
+ACTIVE
+PENDING_CANCEL
+UNKNOWN
+```
+and must still be accounted.
+
+Reconnect must not resume from BBO+risk alone; own-order reconciliation must also pass.
+
+Use exact `C` for normal replacement.
+Use sender-scoped `X` for startup/reconnect recovery only after controlled probe confirms
+selector semantics.
+
+## 7. Order IDs
+
+Order ids are 8 chars and unique per sender.
+
+Do not use a restart-resetting simple counter.
+Use a compact V1 session/process-unique prefix plus local counter, simple enough to test
+and explain.
+
+## 8. Exchange rules
+
+Order entry:
+```text
+ex.req.<SENDER>
 ```
 
-Any unresolved `UNKNOWN` order makes `orderManager.isReconciled()` false.
+Sender in subject and payload must match. A sender manages only its own orders.
 
-Known NATS connection loss invalidates local order trust for quoting purposes.
-The Quoter cannot cancel or add while disconnected; it must stop producing new
-exchange actions and wait for reconnect/reconciliation before resuming exposure.
+Add:
+```text
+<SENDER> A <FEED> <id:8> <B|S> <volume> <price> <M|L|F>
+```
 
-### Current micro-task scope
+Exact cancel:
+```text
+<SENDER> C <FEED> <id:8>
+```
 
-Implement only the pure two-slot lifecycle core and deterministic unit tests:
+Cancel-many:
+```text
+<SENDER> X <FEED> <B|S|X> <price>
+```
+
+Replies:
+```text
+Y <n>
+N <code> <text>
+```
+
+`Y <n>` confirms request handling, not authoritative position.
+
+Quoter normally uses passive `L`.
+Hedger uses `F`.
+
+## 9. Failure rules
+
+When uncertain: stop adding exposure, preserve accounting, reconcile, and resume only
+from authoritative evidence.
+
+Never treat request timeout, disconnect, missing local event, or stale local assumption as
+proof an order is gone.
+
+High transient position is dangerous even if brief.
+Risk-reducing actions outrank profit opportunities.
+
+## 10. Legacy Taker
+
+Modify only after controlled proof of:
+- material correctness/risk bug, or
+- minimal change required for desk-wide safety
+
+No broad refactor.
+
+## 11. Current Job 1.3 Micro Task 1
+
+Implement only pure deterministic two-slot lifecycle core + unit tests:
 
 ```text
-BID slot
-ASK slot
+BID / ASK
 max one logical order per slot
 EMPTY / PENDING_ADD / ACTIVE / PENDING_CANCEL / UNKNOWN
 terminal -> EMPTY
 ```
 
-Do not add NATS Add/Cancel request integration, cancel-many recovery, reconnect
-purge, STP, durable persistence, or a general-purpose OMS in this micro-task.
+Do not implement NATS Add/Cancel, timers, cancel-many recovery, reconnect purge, STP,
+quote generation, persistence, or generic OMS in this micro task.
 
-## 17. Deferred
+## 12. Deferred
 
-Do not implement without evidence:
-- multi-contract
-- directional prediction
-- complex dynamic sizing
-- persistent local trading state
-- speculative abstraction
-- extra accounting streams
-- unrelated Taker refactoring
-- general-purpose order-management framework
-- durable local order database
-- multiple logical quote orders per side
+Defer without evidence: multi-contract, directional prediction, persistent trading DB,
+generic OMS, complex crash recovery, exactly-once framework, multiple quote levels per
+side, and unrelated Taker refactoring.
 
-## 18. Agent execution rules
+## 13. Agent execution rules
 
-1. Work only on the current Job.
-2. Treat this file as the internal contract.
-3. Use `PROTOCOL.md` for external wire details.
-4. Use `NOTES.md` only for evidence/history when needed.
-5. Do not revive old assumptions.
-6. Do not guess unresolved runtime behaviour.
-7. Stop on unexpected repo changes.
-8. Prefer existing architecture over new abstractions.
-9. Run focused tests, full relevant tests, and build validation.
-10. Record new runtime findings in `NOTES.md`.
+1. Work only on current Job/Micro Task.
+2. This file is the internal contract; `PROTOCOL.md` owns wire details.
+3. Use `NOTES.md` for evidence/history, not implementation rules.
+4. Do not revive rejected assumptions or guess unresolved runtime behaviour.
+5. Stop on unexpected repo changes.
+6. Prefer existing architecture; keep file/class count minimal.
+7. Run focused tests, full relevant tests, and build validation.
+8. Record new controlled runtime findings in `NOTES.md`.
+9. Do not start the next Micro Task without reviewer approval.
