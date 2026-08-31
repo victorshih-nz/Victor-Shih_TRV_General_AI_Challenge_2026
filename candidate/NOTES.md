@@ -647,9 +647,9 @@ Decision:
   - accept the next valid risk message as the baseline of a new epoch.
 - This is the minimal v1 solution; no producer-session identifier is added unless evidence later requires it.
 
-#### BBO startup wait
+#### BBO startup wait — superseded by controlled P2 evidence
 
-Decision:
+Original decision before runtime probing:
 - Start with a core live subscription.
 - After subscription registration/flush, wait for the first valid live BBO.
 - Startup wait threshold: 3000 ms, matching `MARKET_DATA_STALE_MS`.
@@ -657,7 +657,19 @@ Decision:
   - remain not ready,
   - emit a warning,
   - never auto-promote readiness.
-- If controlled evidence shows normal BBO updates can exceed this threshold, investigate JetStream latest/replay semantics before changing the design.
+
+Later controlled P2 evidence superseded the acquisition part of this decision:
+- a new core subscriber may receive no BBO while the book is unchanged,
+- `EX_MD` provides retained latest BBO state,
+- core subscription receives future BBO updates promptly once the book changes.
+
+Final v1 startup acquisition decision:
+- subscribe core first,
+- flush,
+- retrieve and validate retained latest `ex.bbo.<FEED>` from `EX_MD`,
+- keep core subscription for subsequent live updates,
+- remain not ready if retained state is missing/invalid and wait for a valid live BBO.
+- 3000 ms remains a warning/staleness threshold and never causes auto-readiness.
 
 #### Reconnect policy
 
@@ -689,11 +701,154 @@ Decision:
 - Avoid logging every unchanged heartbeat.
 - Log meaningful transitions such as state change, suppression change, actual override action, staleness, disconnect, and reconnect.
 
-### 8. Current Job 1.2B-1 remaining investigation
+### 8. Job 1.2B-1 investigation status
 
-Still requires controlled supplied-stack verification:
-- Confirm `EX_META` can be accessed through the selected Java client path and that the `TAKER_FEED` metadata value matches the current Java metadata parser contract.
-- Confirm a core live subscription receives a valid `ex.bbo.<FEED>` message within the 3000 ms startup threshold under normal supplied-stack conditions.
-- If not, investigate JetStream retained/latest-message semantics.
+The previously open runtime questions in this Job were resolved by the controlled P1/P2 probes recorded below.
 
-Do not implement the production NATS runtime until these remaining questions are resolved and recorded.
+Resolved:
+- Java jnats 2.20.5 can read `EX_META` using the configured feed value as the KV key.
+- the real metadata payload is compatible with the existing `Metadata.parse()`.
+- core NATS receives future `ex.bbo.<FEED>` publications.
+- startup cannot rely on a new live BBO being published while the book is unchanged.
+- JetStream `EX_MD` provides retained latest BBO state.
+- retained empty/invalid BBO state remains fail closed.
+
+Result:
+- production Job 1.2 runtime implementation may proceed using the reviewed startup contract: core subscribe -> flush -> retained latest BBO -> validate -> core live updates.
+
+## Job 1.2B-1P1 — Java EX_META controlled probe
+
+### Question
+Can jnats 2.20.5 read the supplied EX_META KV data, and can the existing Metadata parser consume the real payload unchanged?
+
+### Method
+- disposable Java probe
+- jnats 2.20.5
+- `NATS_URL=nats://127.0.0.1:4222`
+- `TAKER_FEED=AAH6`
+- KV bucket: `EX_META`
+- lookup key: configured feed value `AAH6`
+
+### Observed
+- NATS connection status: `CONNECTED`
+- raw EX_META payload:
+
+`ticksize=1 ref_price=600 band=5000 min_volume=1 max_volume=10000000 position_limit=1000000000 max_tps=0 last_traded_price=600`
+
+Existing `Metadata.parse()` returned:
+- feed = `AAH6`
+- tickSize = `1`
+- refPrice = `600`
+- band = `5000`
+
+Negative check:
+- missing `TAKER_FEED` failed closed with:
+  `IllegalStateException: TAKER_FEED is required but missing`
+
+### Decision
+PASS.
+
+Confirmed:
+- jnats 2.20.5 can access the supplied `EX_META` KV bucket.
+- the KV lookup key is the configured feed value, not the literal string `TAKER_FEED`.
+- the supplied metadata payload is compatible with the existing `Metadata.parse()`.
+- no production Metadata change is required for this runtime path.
+
+P2 initial core-live BBO startup probe: FAIL
+
+Java jnats:
+- connected successfully
+- subscribed ex.bbo.AAH6
+- subscription flushed
+- no BBO within 3000 ms
+
+Independent Python core-NATS control:
+- subscribed ex.bbo.AAH6
+- subscription flushed
+- no BBO within 5000 ms
+
+Interpretation:
+- failure is not specific to the Java subscriber
+- supplied stack did not emit a new live BBO during either observation window
+- investigate JetStream retained/latest BBO before implementing startup readiness
+
+## Job 1.2B-1P2 — BBO startup and live-delivery probe
+
+### Initial observation
+Java core NATS subscriber:
+- subscribed `ex.bbo.AAH6`
+- flush completed
+- no valid BBO within 3000 ms
+- result: TIMEOUT
+
+Independent Python control:
+- subscribed same core subject
+- flush completed
+- no BBO within 5000 ms
+- result: TIMEOUT
+
+Interpretation:
+- the initial timeout was not Java-specific.
+- no new BBO was published while the book was unchanged.
+
+### JetStream retained state
+Stream discovery:
+- `EX_MD`
+- subjects: `ex.md.>`, `ex.bbo.>`
+- retained messages present.
+
+Latest retained `ex.bbo.AAH6`:
+- sequence 85
+- payload:
+  `1788104154025535230 AAH6 - 0 - 0`
+
+Interpretation:
+- JetStream latest retrieval works.
+- the latest state represented an empty book and correctly must not satisfy Quoter readiness.
+
+### Controlled live publication
+After core subscribe + flush:
+
+Resting bid:
+- request: BUY 5 @ 599
+- reply: `EXCHANGE Y 0`
+- BBO received after approximately 2.27 ms:
+  `AAH6 599 5 - 0`
+
+Resting ask:
+- request: SELL 5 @ 601
+- reply: `EXCHANGE Y 0`
+- valid two-sided BBO received after approximately 218.95 ms:
+  `AAH6 599 5 601 5`
+
+### Decision
+PASS.
+
+Confirmed:
+- core NATS subscription receives future BBO publications.
+- a new subscriber cannot rely on a live update being published during startup.
+- JetStream `EX_MD` provides retained latest BBO state.
+- retained state may be invalid/empty and must still fail closed.
+- v1 startup should subscribe core first, flush, load retained latest BBO, validate it, then rely on core live updates.
+
+### Final Job 1.2B-1 runtime decision
+
+Based on P1 and P2 controlled evidence:
+
+```text
+metadata:
+EX_META -> configured feed key -> Metadata.parse()
+
+BBO startup:
+core subscribe ex.bbo.<FEED>
+-> flush
+-> retrieve latest retained ex.bbo.<FEED> from EX_MD
+-> validate through the normal BBO path
+-> keep core subscription for future updates
+```
+
+Readiness remains fail closed:
+- retained empty/malformed/stale BBO does not satisfy readiness,
+- 3000 ms remains a market-data warning/staleness threshold,
+- timeout never promotes readiness,
+- reconnect still invalidates pre-disconnect runtime trust and requires newly trusted runtime state according to the design contract.
