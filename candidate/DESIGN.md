@@ -456,7 +456,151 @@ At every `RESUBSCRIBED` recovery:
 Do not use a disconnect-duration threshold. Only newly trusted runtime state
 restores readiness.
 
-## 16. Deferred
+## 16. Quoter order lifecycle
+
+V1 maintains exactly two logical quote slots:
+
+```text
+BID slot
+ASK slot
+```
+
+Each slot may contain at most one logical order.
+
+Minimal slot states:
+
+```text
+EMPTY
+PENDING_ADD
+ACTIVE
+PENDING_CANCEL
+UNKNOWN
+```
+
+A terminal order is removed from the slot and the slot returns to `EMPTY`.
+Do not retain a separate long-lived `CLOSED` state in V1.
+
+### Slot invariant
+
+At all times:
+
+```text
+BID slot -> zero or one logical BID order
+ASK slot -> zero or one logical ASK order
+```
+
+Do not stack multiple logical quotes on the same side.
+
+### Replacement invariant
+
+Cancel-before-replace is mandatory.
+
+Allowed sequence:
+
+```text
+ACTIVE
+-> send cancel
+-> PENDING_CANCEL
+-> confirm previous order terminal
+-> EMPTY
+-> submit replacement
+```
+
+The following is explicitly prohibited:
+
+```text
+cancel request sent
+-> immediately submit replacement
+```
+
+Sending a cancel request does not prove that the previous order is no longer live.
+
+### Timeout semantics
+
+Timeout means that the operation outcome is unknown, not that the operation failed.
+
+```text
+ADD request timeout
+-> order outcome UNKNOWN
+
+CANCEL request timeout
+-> order status UNKNOWN
+```
+
+Never infer from timeout that:
+
+```text
+ADD was rejected
+CANCEL succeeded
+CANCEL failed
+order cannot still fill
+```
+
+An unresolved `UNKNOWN` order blocks new Quoter exposure until reconciliation
+establishes a safe terminal state.
+
+Do not blindly resend an Add using a new order id after an Add timeout.
+
+### Request timeout configuration
+
+Different request types use separate configurable timeout variables.
+
+Initial V1 defaults:
+
+```text
+ADD_REQUEST_TIMEOUT_MS    = 1000
+CANCEL_REQUEST_TIMEOUT_MS = 1000
+```
+
+The numeric values are tuning/configuration values. They may be adjusted from
+measured evidence without changing the lifecycle rule:
+
+```text
+timeout != failure
+```
+
+Emergency cancellation uses a separate deadline:
+
+```text
+EMERGENCY_CANCEL_DISPATCH_TARGET_MS = 100
+```
+
+This is a dispatch target/SLA, not an operation timeout. Missing the target does
+not permit cancellation to be abandoned.
+
+### Quoting gate
+
+Future order-entry integration must enforce:
+
+```text
+canQuote
+=
+runtimeState.isReady()
+AND orderManager.isReconciled()
+```
+
+Any unresolved `UNKNOWN` order makes `orderManager.isReconciled()` false.
+
+Known NATS connection loss invalidates local order trust for quoting purposes.
+The Quoter cannot cancel or add while disconnected; it must stop producing new
+exchange actions and wait for reconnect/reconciliation before resuming exposure.
+
+### Current micro-task scope
+
+Implement only the pure two-slot lifecycle core and deterministic unit tests:
+
+```text
+BID slot
+ASK slot
+max one logical order per slot
+EMPTY / PENDING_ADD / ACTIVE / PENDING_CANCEL / UNKNOWN
+terminal -> EMPTY
+```
+
+Do not add NATS Add/Cancel request integration, cancel-many recovery, reconnect
+purge, STP, durable persistence, or a general-purpose OMS in this micro-task.
+
+## 17. Deferred
 
 Do not implement without evidence:
 - multi-contract
@@ -466,8 +610,11 @@ Do not implement without evidence:
 - speculative abstraction
 - extra accounting streams
 - unrelated Taker refactoring
+- general-purpose order-management framework
+- durable local order database
+- multiple logical quote orders per side
 
-## 17. Agent execution rules
+## 18. Agent execution rules
 
 1. Work only on the current Job.
 2. Treat this file as the internal contract.
