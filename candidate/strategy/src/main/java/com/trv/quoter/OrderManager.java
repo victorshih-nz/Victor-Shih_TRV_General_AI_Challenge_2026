@@ -95,6 +95,86 @@ public class OrderManager {
         slot.orderId = null;
     }
 
+    public synchronized void markAddAccepted(
+            Side side,
+            String orderId) {
+
+        validateInputs(side, orderId);
+
+        Slot slot = slot(side);
+        requireMatchingOrder(slot, orderId);
+        requireState(slot, State.PENDING_ADD);
+
+        // Request acknowledgement is not authoritative lifecycle evidence.
+        // Keep the order PENDING_ADD until A/E/T/C evidence arrives.
+    }
+
+    public synchronized void markAddRejected(
+            Side side,
+            String orderId) {
+
+        validateInputs(side, orderId);
+
+        Slot slot = slot(side);
+        requireMatchingOrder(slot, orderId);
+        requireState(slot, State.PENDING_ADD);
+
+        slot.state = State.UNKNOWN;
+    }
+
+    public synchronized void markAddTimeout(
+            Side side,
+            String orderId) {
+
+        validateInputs(side, orderId);
+
+        Slot slot = slot(side);
+        requireMatchingOrder(slot, orderId);
+        requireState(slot, State.PENDING_ADD);
+
+        slot.state = State.UNKNOWN;
+    }
+
+    public synchronized void markCancelAccepted(
+            Side side,
+            String orderId) {
+
+        validateInputs(side, orderId);
+
+        Slot slot = slot(side);
+        requireMatchingOrder(slot, orderId);
+        requireState(slot, State.PENDING_CANCEL);
+
+        // Request acknowledgement is not authoritative lifecycle evidence.
+        // Keep the order PENDING_CANCEL until A/E/T/C evidence arrives.
+    }
+
+    public synchronized void markCancelRejected(
+            Side side,
+            String orderId) {
+
+        validateInputs(side, orderId);
+
+        Slot slot = slot(side);
+        requireMatchingOrder(slot, orderId);
+        requireState(slot, State.PENDING_CANCEL);
+
+        slot.state = State.UNKNOWN;
+    }
+
+    public synchronized void markCancelTimeout(
+            Side side,
+            String orderId) {
+
+        validateInputs(side, orderId);
+
+        Slot slot = slot(side);
+        requireMatchingOrder(slot, orderId);
+        requireState(slot, State.PENDING_CANCEL);
+
+        slot.state = State.UNKNOWN;
+    }
+
     public synchronized State state(Side side) {
         validateSide(side);
         return slot(side).state;
@@ -114,23 +194,46 @@ public class OrderManager {
         return side == Side.BID ? bid : ask;
     }
 
-    private void requireMatchingOrder(Slot slot, String orderId) {
-        if (slot.orderId == null || !slot.orderId.equals(orderId)) {
-            throw new IllegalStateException("order id does not match slot");
+    private void requireMatchingOrder(
+            Slot slot,
+            String orderId) {
+
+        if (slot.orderId == null
+                || !slot.orderId.equals(orderId)) {
+            throw new IllegalStateException(
+                    "order id does not match slot");
         }
     }
 
-    private void validateInputs(Side side, String orderId) {
+    private void requireState(
+            Slot slot,
+            State expectedState) {
+
+        if (slot.state != expectedState) {
+            throw new IllegalStateException(
+                    "expected state "
+                            + expectedState
+                            + " but was "
+                            + slot.state);
+        }
+    }
+
+    private void validateInputs(
+            Side side,
+            String orderId) {
+
         validateSide(side);
 
         if (orderId == null || orderId.isBlank()) {
-            throw new IllegalArgumentException("order id is required");
+            throw new IllegalArgumentException(
+                    "order id is required");
         }
     }
 
     private void validateSide(Side side) {
         if (side == null) {
-            throw new IllegalArgumentException("side is required");
+            throw new IllegalArgumentException(
+                    "side is required");
         }
     }
 }
