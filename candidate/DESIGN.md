@@ -87,7 +87,7 @@ After each hedge:
 ```text
 execution events
 -> recompute position
--> require fresh BBO
+-> require current valid BBO
 -> decide next hedge
 ```
 
@@ -190,24 +190,34 @@ Ready only when:
 ```text
 valid config
 AND valid metadata
-AND NATS connected
-AND valid fresh two-sided BBO
+AND NATS/subscriptions trusted
+AND valid trusted two-sided BBO
 AND valid fresh desk.risk
 AND desk.risk != UNKNOWN
 ```
 
-Thresholds:
+Freshness:
 ```text
-MARKET_DATA_STALE_MS = 3000
-RISK_STALE_MS        = 1000
+RISK_STALE_MS = 1000
 ```
+
+BBO is latest-state data, not a heartbeat:
+- no age-based BBO expiry while NATS/subscription trust remains continuous,
+- no new BBO means the last valid BBO remains the latest trusted state,
+- a newly received empty, malformed, or otherwise invalid BBO invalidates the old
+  BBO and moves the Quoter to WAITING.
 
 Reconnect:
 ```text
 invalidate old BBO
 invalidate old risk
+clear risk sequence epoch
 readiness=false
-require newly trusted BBO + desk.risk
+wait for RESUBSCRIBED
+revalidate EX_META
+flush/synchronize subscriptions
+recover retained/live BBO
+require NEW desk.risk
 ```
 
 ## 7. BBO startup
@@ -235,12 +245,13 @@ present
 correct feed
 correctly formed
 two-sided valid
-fresh
 ```
 
 Otherwise remain not ready and wait for valid live BBO.
 
-3000 ms is warning/staleness only; never auto-ready.
+Retained BBO age is not a readiness criterion. Under continuous trusted
+NATS/subscription state, the last valid BBO remains trusted until a newer
+authoritative BBO replaces or invalidates it.
 
 ## 8. Metadata
 
@@ -381,7 +392,7 @@ Goal: reduce toward safe boundary.
 Default hedge: Fill-and-Kill.
 
 Each hedge:
-- fresh BBO
+- current valid BBO
 - bounded quantity
 - never exceed required reduction
 - wait for authoritative executions before next decision
@@ -428,14 +439,22 @@ LAME_DUCK
 
 Policy:
 ```text
-DISCONNECTED -> not ready
-CLOSED       -> not ready
-LAME_DUCK    -> not ready
+DISCONNECTED -> reset BBO/risk trust; not ready
+CLOSED       -> reset trust; fail closed
+LAME_DUCK    -> reset trust; not ready
 RECONNECTED  -> still not ready
-RESUBSCRIBED -> does not restore readiness
+RESUBSCRIBED -> synchronization gate only
 ```
 
-Only newly trusted runtime state restores readiness.
+At every `RESUBSCRIBED` recovery:
+- re-read and validate `EX_META`,
+- flush/synchronize subscriptions,
+- restore connection trust,
+- recover the latest retained/live BBO,
+- require a new valid `desk.risk` message before READY.
+
+Do not use a disconnect-duration threshold. Only newly trusted runtime state
+restores readiness.
 
 ## 16. Deferred
 

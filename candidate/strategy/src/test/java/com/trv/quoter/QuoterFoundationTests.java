@@ -96,22 +96,6 @@ class QuoterFoundationTests {
     }
 
     @Test
-    void staleBboNotReady() {
-        Metadata metadata = validMetadata();
-        Bbo stale = new Bbo(new BigDecimal("1000"), new BigDecimal("9"), new BigDecimal("1001"), new BigDecimal("10"), Instant.now().minusMillis(3001));
-
-        assertFalse(MarketReadiness.isReady(DEFAULT_CONFIG, metadata, stale, HedgerState.SAFE, Instant.now()));
-    }
-
-    @Test
-    void negativeBboAgeNotReady() {
-        Metadata metadata = validMetadata();
-        Bbo future = new Bbo(new BigDecimal("1000"), new BigDecimal("9"), new BigDecimal("1001"), new BigDecimal("10"), Instant.now().plusMillis(1000));
-
-        assertFalse(MarketReadiness.isReady(DEFAULT_CONFIG, metadata, future, HedgerState.SAFE, Instant.now()));
-    }
-
-    @Test
     void feedMismatchNotReady() {
         Metadata metadata = Metadata.parse("AAH6", "ticksize=1 ref_price=1000 band=50");
         Bbo fresh = new Bbo(new BigDecimal("1000"), new BigDecimal("9"), new BigDecimal("1001"), new BigDecimal("10"), Instant.now());
@@ -243,5 +227,45 @@ class QuoterFoundationTests {
     @Test
     void expensiveSignalProducesNegativeValuationAdjustment() {
         assertTrue(ValuationSignal.EXPENSIVE.valuationAdjustmentTicks(DEFAULT_CONFIG).compareTo(BigDecimal.ZERO) < 0);
+    }
+
+    @Test
+    void oldBboRemainsReadyWhileStateIsOtherwiseValid() {
+        Metadata metadata = validMetadata();
+
+        Bbo old = new Bbo(
+                new BigDecimal("1000"),
+                new BigDecimal("9"),
+                new BigDecimal("1001"),
+                new BigDecimal("10"),
+                Instant.now().minusSeconds(60));
+
+        assertTrue(
+            MarketReadiness.isReady(
+                DEFAULT_CONFIG,
+                metadata,
+                old,
+                HedgerState.SAFE,
+                Instant.now()));
+    }
+
+    @Test
+    void bboReceivedAtDoesNotControlReadiness() {
+        Metadata metadata = validMetadata();
+
+        Bbo future = new Bbo(
+                new BigDecimal("1000"),
+                new BigDecimal("9"),
+                new BigDecimal("1001"),
+                new BigDecimal("10"),
+                Instant.now().plusSeconds(60));
+
+        assertTrue(
+            MarketReadiness.isReady(
+                DEFAULT_CONFIG,
+                metadata,
+                future,
+                HedgerState.SAFE,
+                Instant.now()));
     }
 }

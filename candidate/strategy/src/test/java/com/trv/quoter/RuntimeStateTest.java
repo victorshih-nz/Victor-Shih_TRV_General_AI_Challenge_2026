@@ -41,14 +41,27 @@ public class RuntimeStateTest {
     }
 
     @Test
-    void testNotReadyWithStaleBBO() {
+    void testBboDoesNotExpireWhenConnectionRemainsTrusted() {
         runtimeState.markConnected();
         runtimeState.acceptBbo(validBbo);
         runtimeState.acceptRisk(safeRisk);
+
         assertTrue(runtimeState.isReady());
 
-        now.addAndGet(3_000_000_001L);
-        assertFalse(runtimeState.isReady());
+        now.addAndGet(10_000_000_000L);
+
+        runtimeState.acceptRisk(
+            new DeskRiskMessage(
+                1633072810000000000L,
+                11,
+                "AAH6",
+                0,
+                100,
+                200,
+                HedgerState.SAFE,
+                HedgeDirection.B));
+
+        assertTrue(runtimeState.isReady());
     }
 
     @Test
@@ -152,5 +165,33 @@ public class RuntimeStateTest {
     runtimeState.acceptRisk(duplicateUnknown);
 
     assertTrue(runtimeState.isReady());
+    }
+
+    @Test
+    void testStaleRiskAndBboBothStaleSequenceResetRegression() {
+    runtimeState.markConnected();
+    runtimeState.acceptBbo(validBbo);
+    runtimeState.acceptRisk(safeRisk);
+    assertTrue(runtimeState.isReady());
+
+    now.addAndGet(3_000_000_001L);
+    assertFalse(runtimeState.isReady());
+
+    runtimeState.acceptBbo(validBbo);
+    runtimeState.acceptRisk(new DeskRiskMessage(1633072800000000000L, 1, "AAH6", 0, 100, 200, HedgerState.SAFE, HedgeDirection.B));
+    assertTrue(runtimeState.isReady());
+    }
+
+    @Test
+    void testInvalidateBboClearsPreviouslyTrustedBbo() {
+        runtimeState.markConnected();
+        runtimeState.acceptBbo(validBbo);
+        runtimeState.acceptRisk(safeRisk);
+
+        assertTrue(runtimeState.isReady());
+
+        runtimeState.invalidateBbo();
+
+        assertFalse(runtimeState.isReady());
     }
 }

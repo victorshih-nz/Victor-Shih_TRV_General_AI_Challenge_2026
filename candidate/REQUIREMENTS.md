@@ -259,7 +259,7 @@ Mandatory candidate-defined safety requirements:
 - Exchange rejection handling
 - Timeout handling
 - Startup gating
-- Stale-market-data protection
+- Market-state trust protection
 - Deterministic tick rounding
 - Sufficient trading/risk logging
 - No new risk while critical state is unknown
@@ -291,21 +291,16 @@ Batch 1/3 may tune these values using measured evidence, but the relationship ru
 The Quoter must not place orders until:
 
 1. instrument metadata is loaded and valid,
-2. a valid two-sided BBO has been received,
+2. a valid two-sided BBO has been received and is currently trusted,
 3. Hedger desk state is no longer `UNKNOWN`,
-4. market data is not stale.
+4. NATS connection/subscription trust is established and desk-risk heartbeat is fresh.
 
-Initial default:
+BBO is latest-state data, not a heartbeat. A valid BBO remains the latest trusted
+market state while NATS connection and subscription continuity remain trusted; it
+does not expire solely because no new update has arrived.
 
-`MARKET_DATA_STALE_MS = 3000`
-
-This is a configurable defensive threshold, not a market-model constant.
-
-If the BBO becomes stale or invalid:
-
-- cancel all Quoter resting orders,
-- submit no new quote,
-- wait for valid fresh state.
+A newly received empty, malformed, or otherwise invalid BBO invalidates the
+previously trusted BBO and causes quoting to pause until a new valid BBO is received.
 
 ## 11. Risk Priority
 

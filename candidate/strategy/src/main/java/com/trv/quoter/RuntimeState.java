@@ -5,7 +5,6 @@ import java.util.function.LongSupplier;
 
 public final class RuntimeState {
 
-    private static final long MARKET_DATA_STALE_NS = 3_000_000_000L;
     private static final long RISK_STALE_NS = 1_000_000_000L;
 
     private final String feed;
@@ -15,7 +14,6 @@ public final class RuntimeState {
     private boolean connectionTrusted;
 
     private Bbo trustedBbo;
-    private long bboReceivedAtNs;
 
     private DeskRiskMessage trustedRisk;
     private long riskReceivedAtNs;
@@ -47,15 +45,14 @@ public final class RuntimeState {
         resetTrust();
     }
 
-    public void markConnected() {
+    public synchronized void markConnected() {
         connectionTrusted = true;
     }
 
-    public void resetTrust() {
+    public synchronized void resetTrust() {
         connectionTrusted = false;
 
         trustedBbo = null;
-        bboReceivedAtNs = 0L;
 
         trustedRisk = null;
         riskReceivedAtNs = 0L;
@@ -63,16 +60,19 @@ public final class RuntimeState {
         lastAcceptedRiskSeq = null;
     }
 
-    public void acceptBbo(Bbo bbo) {
+    public synchronized void acceptBbo(Bbo bbo) {
         if (bbo == null || !bbo.isValid(metadata)) {
             return;
         }
 
         trustedBbo = bbo;
-        bboReceivedAtNs = nanoClock.getAsLong();
     }
 
-    public void acceptRisk(DeskRiskMessage risk) {
+    public synchronized void invalidateBbo() {
+        trustedBbo = null;
+    }
+
+    public synchronized void acceptRisk(DeskRiskMessage risk) {
         if (risk == null) {
             return;
         }
@@ -91,29 +91,25 @@ public final class RuntimeState {
         lastAcceptedRiskSeq = risk.getSequence();
     }
 
-    public boolean isReady() {
+    public synchronized boolean isReady() {
         if (!connectionTrusted) {
             return false;
+        }
+
+        long now = nanoClock.getAsLong();
+
+        if (trustedRisk != null
+                && now - riskReceivedAtNs > RISK_STALE_NS) {
+            trustedRisk = null;
+            riskReceivedAtNs = 0L;
+            lastAcceptedRiskSeq = null;
         }
 
         if (trustedBbo == null || !trustedBbo.isValid(metadata)) {
             return false;
         }
 
-        long now = nanoClock.getAsLong();
-
-        if (now - bboReceivedAtNs > MARKET_DATA_STALE_NS) {
-            return false;
-        }
-
         if (trustedRisk == null) {
-            return false;
-        }
-
-        if (now - riskReceivedAtNs > RISK_STALE_NS) {
-            trustedRisk = null;
-            riskReceivedAtNs = 0L;
-            lastAcceptedRiskSeq = null;
             return false;
         }
 

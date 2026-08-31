@@ -669,14 +669,20 @@ Final v1 startup acquisition decision:
 - retrieve and validate retained latest `ex.bbo.<FEED>` from `EX_MD`,
 - keep core subscription for subsequent live updates,
 - remain not ready if retained state is missing/invalid and wait for a valid live BBO.
-- 3000 ms remains a warning/staleness threshold and never causes auto-readiness.
+- This acquisition decision was later refined by controlled runtime liveness evidence:
+  there is no age-based BBO staleness threshold. Under continuous trusted
+  connection/subscription state, the last valid BBO remains trusted until a newer
+  authoritative BBO replaces or invalidates it.
 
 #### Reconnect policy
 
 Decision:
 - Treat reconnect as a clean runtime trust state.
 - Do not reuse pre-disconnect BBO or desk-risk state.
-- Require a newly received valid BBO and newly received valid desk-risk message before restoring readiness.
+- At `RESUBSCRIBED`, re-read and validate `EX_META` on every reconnect; do not use
+  a disconnect-duration threshold.
+- Require a newly trusted BBO (retained or live after resubscription) and a newly
+  received valid desk-risk message before restoring readiness.
 - Revisit only if measured evidence later demonstrates a material performance problem.
 
 #### Risk freshness time base
@@ -848,7 +854,114 @@ core subscribe ex.bbo.<FEED>
 ```
 
 Readiness remains fail closed:
-- retained empty/malformed/stale BBO does not satisfy readiness,
-- 3000 ms remains a market-data warning/staleness threshold,
+- retained empty/malformed/invalid BBO does not satisfy readiness,
+- BBO does not expire solely because time passes while connection/subscription trust
+  remains continuous,
+- a newly received empty, malformed, or otherwise invalid BBO invalidates the
+  previously trusted BBO,
+- desk-risk heartbeat freshness remains 1000 ms,
 - timeout never promotes readiness,
-- reconnect still invalidates pre-disconnect runtime trust and requires newly trusted runtime state according to the design contract.
+- reconnect invalidates pre-disconnect runtime trust, revalidates `EX_META`, recovers
+  newly trusted retained/live BBO state, and requires a new valid desk-risk message.
+
+### Job 1.2B — Java Quoter runtime integration controlled probe
+
+A controlled runtime probe was used to verify the new Java `QuoterIntegration`
+against the supplied Docker/NATS stack.
+
+The Java probe instantiated the real production integration, which:
+
+- connected to `NATS_URL=nats://127.0.0.1:4222`
+- read `EX_META` using the configured feed key `AAH6`
+- parsed metadata successfully:
+  - feed = `AAH6`
+  - tickSize = `1`
+- created `RuntimeState`
+- subscribed to:
+  - `ex.bbo.AAH6`
+  - `desk.risk.AAH6`
+- retrieved the latest retained BBO from JetStream stream `EX_MD`
+
+The retained latest BBO was independently confirmed as:
+
+`1788137122711105355 AAH6 599 5 601 5`
+
+A separate disposable Python publisher then sent one valid risk message to:
+
+`desk.risk.AAH6`
+
+using the v1 payload shape:
+
+`<ts_ns> 1 AAH6 0 100 200 SAFE X`
+
+Observed Java readiness:
+
+- initial: `false`
+- t+500 ms: `false`
+- t+1000 ms: `false`
+- t+1500 ms: `false`
+- t+2000 ms: `true`
+- t+2500 ms: `true`
+- t+3000 ms: `false`
+- remained `false` afterwards
+
+Interpretation:
+
+- valid retained BBO alone did not make the Quoter ready
+- after a fresh valid `desk.risk` message arrived, readiness became true
+- after no further risk heartbeat was received for more than the 1-second
+  risk freshness threshold, readiness returned to false
+- this confirms the runtime path:
+
+  `EX_META -> RuntimeState -> retained EX_MD BBO -> live desk.risk -> READY -> risk stale -> fail closed`
+
+The risk timestamp inside the message was not used as freshness authority.
+Freshness continued to be measured from local monotonic receipt time inside
+`RuntimeState`.
+
+This probe used disposable test tooling only. No probe artifacts are intended
+for commit.
+
+### Quoter runtime readiness and reconnect investigation
+
+Controlled runtime testing showed that BBO delivery is event-driven state, not a
+heartbeat. A valid two-sided BBO remained the latest trusted exchange state for
+more than three seconds while the NATS connection remained continuously trusted
+and fresh desk-risk heartbeats continued. The Quoter remained READY throughout
+the test.
+
+This invalidated the original `MARKET_DATA_STALE_MS=3000` readiness assumption.
+BBO trust is therefore based on connection/subscription continuity rather than
+elapsed time.
+
+A separate controlled test confirmed that a newly published empty or otherwise
+invalid BBO must invalidate the previously trusted BBO. This is different from
+receiving no BBO update:
+
+- no new BBO under continuous trusted transport: retain the last valid BBO;
+- new invalid/empty BBO: invalidate the old BBO and enter WAITING.
+
+Risk has different semantics. `desk.risk` is explicitly heartbeat-backed and
+becomes stale after 1 second without a valid locally received update. Staleness
+clears the risk sequence baseline and causes the Quoter to enter WAITING.
+
+Reconnect was verified using a client-only forced reconnect so that NATS,
+JetStream, the exchange, and the simulator remained alive. The controlled
+sequence was:
+
+1. startup with retained valid BBO + risk sequence >=10 -> READY;
+2. client disconnect -> immediate trust reset and NOT READY;
+3. reconnect/resubscribe -> EX_META revalidated and retained BBO recovered;
+4. new risk epoch starting at sequence 1 -> READY;
+5. stop risk heartbeat for >1 second -> NOT READY.
+
+The probe completed with:
+
+- `readyBeyondThreeSeconds=true`
+- `reconnectRecovered=true`
+- `readyAfterRiskStale=false`
+
+An earlier experiment using `docker compose restart nats` was rejected as a
+reconnect test because restarting the NATS server temporarily removed/recreated
+JetStream infrastructure and caused the simulator to lose its connection. That
+experiment tested infrastructure restart rather than Quoter client reconnect.
