@@ -459,3 +459,241 @@ Qwen 7B
 
 Real repo / Maven
 → will provide actual verification evidence
+
+
+## Job 1.2B — Quoter runtime investigation and agent-review record
+
+### 1. Desk-risk parser task routing
+
+Question:
+- Could the bounded desk-risk wire parser be delegated to the local Qwen2.5-Coder 7B model while keeping runtime/NATS integration with the higher-confidence agent path?
+
+Decision:
+- Yes. Qwen was used only as a bounded draft generator for `DeskRiskMessage`, `HedgeDirection`, and parser tests.
+- Qwen terminal/build claims were not treated as authoritative evidence because the Continue terminal was previously shown to run in a sandbox rather than the real Windows repository.
+- Real repository modification, Maven validation, Git validation, and GitHub CI remained the evidence sources.
+
+Agent interaction:
+- First Qwen draft made the `DeskRiskMessage` constructor private while its own tests instantiated the constructor directly.
+- The first constructor also failed to enforce the invariants that the tests expected.
+- Reviewer rejected the draft before integration.
+- A correction prompt required a public constructor and constructor-level invariant enforcement.
+- The second draft corrected those issues.
+
+Human/reviewer decision:
+- Accept the corrected production parser.
+- Keep sequence tracking, staleness, NATS integration, readiness, and quoting logic out of the parser.
+- Preserve the exact eight-field internal wire contract:
+  `<ts_ns> <seq> <feed> <net_position> <soft_limit> <hard_limit> <state> <direction>`.
+
+### 2. Unexpected-change stop rule during parser integration
+
+Observation:
+- The first real Maven run failed because `HedgeDirection.java` existed as an empty file.
+- `git status` also showed unrelated modifications:
+  - `strategy/pom.xml`
+  - `QuoterFoundationTests.java`
+  - an untracked `QuoterRuntime.java`
+  - `NOTES.md`
+  - generated `strategy/target/`
+
+Investigation:
+- `pom.xml` had unexpectedly gained `io.nats:jnats:2.20.5`.
+- `QuoterFoundationTests.java` contained new runtime-readiness tests.
+- `QuoterRuntime.java` contained an ad-hoc desk-risk parser accepting forms such as `SAFE` and `state=SAFE`.
+- That parser conflicted with the approved complete eight-field `desk.risk.<FEED>` contract.
+
+Decision:
+- Apply the stop rule: inspect unexpected changes before continuing.
+- Restore the out-of-scope `pom.xml` and `QuoterFoundationTests.java` changes.
+- Remove the unapproved `QuoterRuntime.java`.
+- Keep the intended `NOTES.md` investigation record.
+- Populate the real `HedgeDirection.java` with the approved `B`, `S`, `X` enum.
+- Do not treat an agent investigation task as permission to modify production code.
+
+### 3. Real parser validation
+
+Real Windows repository validation:
+- `mvn -B test`
+- Result:
+  - `DeskRiskMessageTest`: 17 tests, 0 failures
+  - `QuoterFoundationTests`: 24 tests, 0 failures
+  - total: 41 tests, 0 failures
+  - `BUILD SUCCESS`
+- `git diff --check`: clean.
+
+Repository hygiene:
+- VS Code automatically added `java.configuration.updateBuildConfiguration = interactive` to `.vscode/settings.json`.
+- This was unrelated to Job 1.2 and was restored instead of committed.
+- Maven `strategy/target/` output was treated as generated build output and removed before commit.
+
+Remote verification:
+- Branch: `batch1/job-1.2-quoter-runtime-foundation`
+- Commit: `9765ebd` — `feat: add desk risk message parser`
+- Branch was one commit ahead of `main` and zero commits behind at verification time.
+- Remote commit scope was limited to:
+  - `candidate/NOTES.md`
+  - `DeskRiskMessage.java`
+  - `HedgeDirection.java`
+  - `DeskRiskMessageTest.java`
+- GitHub Actions `TRV CI` run #26 completed successfully.
+
+Interpretation:
+- Qwen can be useful for bounded deterministic drafts, but reviewer inspection and real-repository evidence remain mandatory.
+- Agent-generated tests are not evidence until they compile and pass in the real project environment.
+
+### 4. Job 1.2B-1 — jnats API investigation
+
+Question:
+- What minimum verified jnats API surface is required for Quoter runtime readiness, metadata access, BBO subscription, desk-risk subscription, connection-loss handling, and subscription registration?
+
+Agent investigation:
+- Copilot selected `io.nats:jnats:2.20.5` and identified APIs including:
+  - `Nats.connect(...)`
+  - `Options.Builder.server(...)`
+  - connection listeners
+  - dispatcher/core subscriptions
+  - `Connection.flush(Duration)`
+  - `Connection.keyValue(...)`
+  - `KeyValue.get(...)`
+  - `Connection.getStatus()`
+- Copilot recommended a core live subscription for `ex.bbo.<FEED>` and a core subscription for `desk.risk.<FEED>`.
+
+Reviewer challenge:
+- Copilot incorrectly listed the `desk.risk` payload format as requiring a runtime probe even though the internal design contract already defines the exact eight-field schema.
+- Copilot also classified `ConnectionListener.Events` enum constants as a runtime probe even though they can be verified directly from the selected client bytecode/source.
+- BBO reasoning was refined: the unresolved issue is not whether a core subscriber can receive future publications, but whether startup needs retained/latest-message semantics rather than waiting for the next live BBO.
+- `flush(Duration)` is only a subscription-registration barrier; it does not prove that valid BBO or risk data has been received and does not itself satisfy readiness.
+
+### 5. jnats bytecode verification
+
+Initial issue:
+- A `javap` command used backslash escaping for nested Java classes in PowerShell and failed with `class not found`.
+
+Correction:
+- Use single-quoted nested class names in PowerShell.
+
+Commands:
+- `jar tf D:\temp\jnats-2.20.5.jar | Select-String 'ConnectionListener|Connection\$Status'`
+- `javap -classpath D:\temp\jnats-2.20.5.jar 'io.nats.client.ConnectionListener$Events'`
+- `javap -classpath D:\temp\jnats-2.20.5.jar 'io.nats.client.Connection$Status'`
+
+Verified `ConnectionListener.Events` constants:
+- `CONNECTED`
+- `CLOSED`
+- `DISCONNECTED`
+- `RECONNECTED`
+- `RESUBSCRIBED`
+- `DISCOVERED_SERVERS`
+- `LAME_DUCK`
+
+Verified `Connection.Status` constants:
+- `DISCONNECTED`
+- `CONNECTED`
+- `CLOSED`
+- `RECONNECTING`
+- `CONNECTING`
+
+Runtime policy derived from the verified API:
+- `DISCONNECTED` => readiness false immediately.
+- `CLOSED` => readiness false immediately.
+- `LAME_DUCK` => fail closed.
+- `RECONNECTED` does not restore readiness by itself.
+- `RESUBSCRIBED` does not restore readiness by itself.
+- Only connected runtime with newly valid market/risk state can become ready.
+
+### 6. DESIGN.md context reduction
+
+Problem:
+- The previous `DESIGN.md` had become too large for efficient repeated agent attachment.
+- Important implementation contracts, especially `desk.risk`, were surrounded by duplicated rationale, diagrams, pricing details, and repeated risk rules.
+- During Job 1.2A/1.2B investigation, this contributed to an agent missing an already-defined internal contract when the full design file was not attached.
+
+Decision:
+- Refactor `DESIGN.md` into an agent-friendly implementation contract rather than a design narrative.
+- Keep:
+  - design priorities,
+  - runtime architecture,
+  - execution-accounting invariants,
+  - startup gate,
+  - full desk-risk internal wire contract,
+  - Quoter readiness,
+  - pricing/risk invariants,
+  - Hedger risk states,
+  - NATS runtime decisions,
+  - explicitly unresolved runtime questions.
+- Avoid duplicating detailed external exchange protocol already owned by `PROTOCOL.md`.
+- Keep investigation history and rejected assumptions in `NOTES.md`.
+
+Sources-of-truth split:
+- `PROTOCOL.md` => supplied exchange/external wire semantics.
+- `DESIGN.md` => desk architecture, internal contracts, safety invariants, current runtime decisions.
+- `NOTES.md` => questions, probes, agent mistakes, reviewer challenges, evidence, and decisions.
+
+### 7. Runtime decisions confirmed during DESIGN review
+
+#### Sequence epoch after Hedger restart
+
+Problem:
+- `seq` is monotonic only for one Hedger process lifetime.
+- If Quoter permanently remembers a high sequence number, a restarted Hedger beginning from a low sequence could otherwise be ignored indefinitely.
+
+Decision:
+- During a currently trusted/fresh risk epoch:
+  - `seq <= lastAcceptedSeq` is ignored.
+- If trust is lost because of risk staleness, NATS disconnect/reconnect, or equivalent startup re-establishment:
+  - enter `UNKNOWN`,
+  - invalidate the previous sequence epoch,
+  - accept the next valid risk message as the baseline of a new epoch.
+- This is the minimal v1 solution; no producer-session identifier is added unless evidence later requires it.
+
+#### BBO startup wait
+
+Decision:
+- Start with a core live subscription.
+- After subscription registration/flush, wait for the first valid live BBO.
+- Startup wait threshold: 3000 ms, matching `MARKET_DATA_STALE_MS`.
+- If no valid BBO arrives within 3000 ms:
+  - remain not ready,
+  - emit a warning,
+  - never auto-promote readiness.
+- If controlled evidence shows normal BBO updates can exceed this threshold, investigate JetStream latest/replay semantics before changing the design.
+
+#### Reconnect policy
+
+Decision:
+- Treat reconnect as a clean runtime trust state.
+- Do not reuse pre-disconnect BBO or desk-risk state.
+- Require a newly received valid BBO and newly received valid desk-risk message before restoring readiness.
+- Revisit only if measured evidence later demonstrates a material performance problem.
+
+#### Risk freshness time base
+
+Decision:
+- Risk staleness is based on time since the last valid local receipt using a local monotonic clock.
+- Do not compute staleness from `now - remote ts_ns`.
+- Remote/process clock differences are expected and make cross-process timestamp subtraction unsuitable as the freshness authority.
+- `ts_ns` is still parsed and retained for diagnostics/investigation.
+
+#### Desk-risk override logging
+
+Decision:
+- Desk risk takes priority over normal Quoter economics.
+- When risk causes an actual suppression/override transition, record a meaningful log.
+- Minimum useful context:
+  - risk state,
+  - direction,
+  - net position,
+  - suppressed side or overridden action,
+  - reason.
+- Avoid logging every unchanged heartbeat.
+- Log meaningful transitions such as state change, suppression change, actual override action, staleness, disconnect, and reconnect.
+
+### 8. Current Job 1.2B-1 remaining investigation
+
+Still requires controlled supplied-stack verification:
+- Confirm `EX_META` can be accessed through the selected Java client path and that the `TAKER_FEED` metadata value matches the current Java metadata parser contract.
+- Confirm a core live subscription receives a valid `ex.bbo.<FEED>` message within the 3000 ms startup threshold under normal supplied-stack conditions.
+- If not, investigate JetStream retained/latest-message semantics.
+
+Do not implement the production NATS runtime until these remaining questions are resolved and recorded.
