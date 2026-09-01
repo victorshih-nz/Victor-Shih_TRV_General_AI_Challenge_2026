@@ -42,6 +42,7 @@ final class OrderRequestClient implements AutoCloseable {
     private final ScheduledExecutorService deadlineScheduler;
     private final Duration addUncertaintyTimeout;
     private final Duration cancelUncertaintyTimeout;
+    private final Runnable lifecycleStateChanged;
 
     private volatile boolean closed;
 
@@ -66,7 +67,39 @@ final class OrderRequestClient implements AutoCloseable {
             transport,
             newDeadlineScheduler(),
             addUncertaintyTimeout,
-            cancelUncertaintyTimeout);
+            cancelUncertaintyTimeout,
+            () -> {
+            });
+    }
+
+    /**
+     * Production constructor: request uncertainty wakes reconciliation
+     * immediately rather than waiting for its periodic scheduler tick.
+     */
+    OrderRequestClient(
+            String sender,
+            String feed,
+            Metadata metadata,
+            OrderManager orderManager,
+            BooleanSupplier addEnvironmentReady,
+            BooleanSupplier transportTrusted,
+            RequestTransport transport,
+            Duration addUncertaintyTimeout,
+            Duration cancelUncertaintyTimeout,
+            Runnable lifecycleStateChanged) {
+
+        this(
+            sender,
+            feed,
+            metadata,
+            orderManager,
+            addEnvironmentReady,
+            transportTrusted,
+            transport,
+            newDeadlineScheduler(),
+            addUncertaintyTimeout,
+            cancelUncertaintyTimeout,
+            lifecycleStateChanged);
     }
 
     OrderRequestClient(
@@ -80,6 +113,34 @@ final class OrderRequestClient implements AutoCloseable {
             ScheduledExecutorService deadlineScheduler,
             Duration addUncertaintyTimeout,
             Duration cancelUncertaintyTimeout) {
+
+        this(
+            sender,
+            feed,
+            metadata,
+            orderManager,
+            addEnvironmentReady,
+            transportTrusted,
+            transport,
+            deadlineScheduler,
+            addUncertaintyTimeout,
+            cancelUncertaintyTimeout,
+            () -> {
+            });
+    }
+
+    OrderRequestClient(
+            String sender,
+            String feed,
+            Metadata metadata,
+            OrderManager orderManager,
+            BooleanSupplier addEnvironmentReady,
+            BooleanSupplier transportTrusted,
+            RequestTransport transport,
+            ScheduledExecutorService deadlineScheduler,
+            Duration addUncertaintyTimeout,
+            Duration cancelUncertaintyTimeout,
+            Runnable lifecycleStateChanged) {
 
         if (sender == null
                 || sender.length() != 8
@@ -132,6 +193,11 @@ final class OrderRequestClient implements AutoCloseable {
                 deadlineScheduler,
                 "deadlineScheduler is required");
 
+        this.lifecycleStateChanged =
+            Objects.requireNonNull(
+                lifecycleStateChanged,
+                "lifecycleStateChanged is required");
+
         validateDuration(
             addUncertaintyTimeout,
             "addUncertaintyTimeout");
@@ -163,7 +229,7 @@ final class OrderRequestClient implements AutoCloseable {
         /*
          * This is only the foundation safety gate.
          * Profitability/inventory/adverse-selection policy belongs to the
-         * later quote-policy stage.
+         * quote-policy stage.
          */
         if (!addEnvironmentReady.getAsBoolean()) {
             throw new IllegalStateException(
@@ -461,6 +527,12 @@ final class OrderRequestClient implements AutoCloseable {
              */
             return;
         }
+
+        /*
+         * Wake reconciliation immediately after the shared OrderManager has
+         * become UNKNOWN. This callback owns no order state.
+         */
+        lifecycleStateChanged.run();
 
         if (error == null) {
             logger.warning(
