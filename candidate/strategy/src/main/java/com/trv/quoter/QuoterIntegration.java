@@ -3,13 +3,17 @@ package com.trv.quoter;
 import io.nats.client.Connection;
 import io.nats.client.ConnectionListener;
 import io.nats.client.Dispatcher;
+import io.nats.client.JetStreamApiException;
+import io.nats.client.JetStreamManagement;
 import io.nats.client.Nats;
 import io.nats.client.Options;
 import io.nats.client.api.MessageInfo;
+import io.nats.client.api.StreamInfo;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.HashSet;
+import java.util.Objects;
 import java.util.Set;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -33,7 +37,9 @@ public final class QuoterIntegration implements ConnectionListener {
     private Metadata metadata;
     private RuntimeState runtimeState;
     private OrderRequestClient orderRequestClient;
+    private ReconciliationCoordinator reconciliationCoordinator;
 
+    private final Object addRegistrationLock = new Object();
     private final Object bboRecoveryLock = new Object();
     private boolean liveBboSeen;
     private volatile boolean subscriptionsReady;
@@ -68,7 +74,15 @@ public final class QuoterIntegration implements ConnectionListener {
             new OwnLifecycleRouter(
                 sender,
                 orderManager,
-                MAX_EXECUTION_DEDUP_ENTRIES);
+                MAX_EXECUTION_DEDUP_ENTRIES,
+                () -> {
+                    ReconciliationCoordinator coordinator =
+                        reconciliationCoordinator;
+
+                    if (coordinator != null) {
+                        coordinator.signal();
+                    }
+                });
 
         this.liveBboSeen = false;
         this.subscriptionsReady = false;
@@ -129,6 +143,61 @@ public final class QuoterIntegration implements ConnectionListener {
         runtimeState.markConnected();
         recoverRetainedBbo();
 
+        JetStreamManagement jsm =
+            natsConnection.jetStreamManagement();
+
+        ReconciliationCoordinator.ReplaySource replaySource =
+            new ReconciliationCoordinator.ReplaySource() {
+                @Override
+                public ReconciliationCoordinator.StreamWindow snapshot()
+                        throws Exception {
+
+                    StreamInfo info =
+                        jsm.getStreamInfo("EX_MD");
+
+                    return new ReconciliationCoordinator.StreamWindow(
+                        info.getStreamState().getFirstSequence(),
+                        info.getStreamState().getLastSequence());
+                }
+
+                @Override
+                public ReconciliationCoordinator.ReplayMessage next(
+                        long cursor)
+                        throws Exception {
+
+                    try {
+                        MessageInfo message =
+                            jsm.getNextMessage(
+                                "EX_MD",
+                                cursor,
+                                ownMarketDataSubject);
+
+                        if (message == null) {
+                            return null;
+                        }
+
+                        if (!ownMarketDataSubject.equals(
+                                message.getSubject())) {
+
+                            throw new IllegalStateException(
+                                "replay subject mismatch: "
+                                    + message.getSubject());
+                        }
+
+                        return new ReconciliationCoordinator.ReplayMessage(
+                            message.getSeq(),
+                            message.getData());
+
+                    } catch (JetStreamApiException e) {
+                        if (e.getApiErrorCode() == 10037) {
+                            return null;
+                        }
+
+                        throw e;
+                    }
+                }
+            };
+
         orderRequestClient =
             new OrderRequestClient(
                 sender,
@@ -136,7 +205,9 @@ public final class QuoterIntegration implements ConnectionListener {
                 metadata,
                 orderManager,
                 () -> runtimeState != null
-                    && runtimeState.isReady(),
+                    && runtimeState.isReady()
+                    && reconciliationCoordinator != null
+                    && reconciliationCoordinator.isHealthy(),
                 this::isOrderRequestTransportTrusted,
                 (subject, payload, timeout) ->
                     natsConnection
@@ -153,7 +224,37 @@ public final class QuoterIntegration implements ConnectionListener {
                 Duration.ofMillis(
                     readPositiveTimeoutMillis(
                         "CANCEL_REQUEST_TIMEOUT_MS",
-                        DEFAULT_CANCEL_REQUEST_TIMEOUT_MS)));
+                        DEFAULT_CANCEL_REQUEST_TIMEOUT_MS)),
+                () -> {
+                    ReconciliationCoordinator coordinator =
+                        reconciliationCoordinator;
+
+                    if (coordinator != null) {
+                        coordinator.signal();
+                    }
+                });
+
+        reconciliationCoordinator =
+            new ReconciliationCoordinator(
+                orderManager,
+                this::isRecoveryInfrastructureUsable,
+                replaySource,
+                new ReconciliationCoordinator.LifecycleSink() {
+                    @Override
+                    public void accept(byte[] data) {
+                        ownLifecycleRouter.accept(data);
+                    }
+
+                    @Override
+                    public void clearExecutionDedupForReconciledEpoch() {
+                        ownLifecycleRouter
+                            .clearExecutionDedupForReconciledEpoch();
+                    }
+                },
+                side -> requireOrderRequestClient()
+                    .requestCancel(side));
+
+        reconciliationCoordinator.initialize();
     }
 
     private void recoverRetainedBbo() {
@@ -379,13 +480,17 @@ public final class QuoterIntegration implements ConnectionListener {
 
             recoverRetainedBbo();
 
+            if (reconciliationCoordinator != null) {
+                reconciliationCoordinator.signal();
+            }
+
             /*
              * Do NOT clear the Quoter execution dedup set here.
              *
-             * Future reconciliation optimization:
-             * clear it only after authoritative own-order reconciliation has
-             * completed successfully, in the same serialized lifecycle
-             * context, before new exposure is re-enabled.
+             * Reconciliation owns epoch rollover. It clears dedup only after
+             * authoritative recovery has completed with both order slots EMPTY,
+             * while lifecycle routing remains serialized and before new
+             * exposure is re-enabled.
              *
              * Never clear merely because RECONNECTED/RESUBSCRIBED occurred.
              */
@@ -457,12 +562,24 @@ public final class QuoterIntegration implements ConnectionListener {
             int quantity,
             long price) {
 
-        requireOrderRequestClient()
-            .requestAdd(
-                side,
-                orderId,
-                quantity,
-                price);
+        synchronized (addRegistrationLock) {
+            ReconciliationCoordinator coordinator =
+                reconciliationCoordinator;
+
+            if (coordinator == null) {
+                throw new IllegalStateException(
+                    "reconciliation coordinator is not initialized");
+            }
+
+            coordinator.prepareForNewExposure();
+
+            requireOrderRequestClient()
+                .requestAdd(
+                    side,
+                    orderId,
+                    quantity,
+                    price);
+        }
     }
 
     /*
@@ -481,6 +598,10 @@ public final class QuoterIntegration implements ConnectionListener {
     }
 
     public void close() throws Exception {
+        if (reconciliationCoordinator != null) {
+            reconciliationCoordinator.close();
+        }
+
         if (orderRequestClient != null) {
             orderRequestClient.close();
         }
@@ -500,6 +621,13 @@ public final class QuoterIntegration implements ConnectionListener {
     }
 
     private boolean isOrderRequestTransportTrusted() {
+        return subscriptionsReady
+            && natsConnection != null
+            && natsConnection.getStatus()
+                == Connection.Status.CONNECTED;
+    }
+
+    private boolean isRecoveryInfrastructureUsable() {
         return subscriptionsReady
             && natsConnection != null
             && natsConnection.getStatus()
@@ -579,6 +707,7 @@ public final class QuoterIntegration implements ConnectionListener {
         private final String sender;
         private final OrderManager orderManager;
         private final int maxExecutionDedupEntries;
+        private final Runnable lifecycleStateChanged;
 
         private final Set<ExecutionKey>
             executionDedup = new HashSet<>();
@@ -590,13 +719,29 @@ public final class QuoterIntegration implements ConnectionListener {
             this(
                 sender,
                 orderManager,
-                MAX_EXECUTION_DEDUP_ENTRIES);
+                MAX_EXECUTION_DEDUP_ENTRIES,
+                () -> {
+                });
         }
 
         OwnLifecycleRouter(
                 String sender,
                 OrderManager orderManager,
                 int maxExecutionDedupEntries) {
+
+            this(
+                sender,
+                orderManager,
+                maxExecutionDedupEntries,
+                () -> {
+                });
+        }
+
+        OwnLifecycleRouter(
+                String sender,
+                OrderManager orderManager,
+                int maxExecutionDedupEntries,
+                Runnable lifecycleStateChanged) {
 
             if (sender == null
                     || sender.length() != 8) {
@@ -620,6 +765,10 @@ public final class QuoterIntegration implements ConnectionListener {
             this.orderManager = orderManager;
             this.maxExecutionDedupEntries =
                 maxExecutionDedupEntries;
+            this.lifecycleStateChanged =
+                Objects.requireNonNull(
+                    lifecycleStateChanged,
+                    "lifecycleStateChanged is required");
         }
 
         synchronized void accept(byte[] data) {
@@ -645,11 +794,31 @@ public final class QuoterIntegration implements ConnectionListener {
                         + "lifecycle event; Quoter lifecycle "
                         + "marked UNKNOWN. raw=" + raw,
                     e);
+            } finally {
+                lifecycleStateChanged.run();
             }
         }
 
         synchronized void markUnknownOnTrustLoss() {
-            markAllOccupiedUnknown();
+            try {
+                markAllOccupiedUnknown();
+            } finally {
+                lifecycleStateChanged.run();
+            }
+        }
+
+        synchronized void clearExecutionDedupForReconciledEpoch() {
+            if (orderManager.state(OrderManager.Side.BID)
+                        != OrderManager.State.EMPTY
+                    || orderManager.state(OrderManager.Side.ASK)
+                        != OrderManager.State.EMPTY) {
+
+                throw new IllegalStateException(
+                    "cannot clear lifecycle execution dedup "
+                        + "while an order slot is occupied");
+            }
+
+            executionDedup.clear();
         }
 
         private void parseAndRoute(String raw) {
@@ -1079,14 +1248,10 @@ public final class QuoterIntegration implements ConnectionListener {
         }
 
         /*
-         * Future reconciliation optimization:
-         *
-         * executionDedup.clear()
-         *
-         * is safe only after authoritative reconciliation has completed
-         * successfully, while lifecycle routing is serialized, and before
-         * new exposure is enabled. Do not clear on reconnect/resubscribe
-         * alone.
+         * executionDedup is cleared only by
+         * clearExecutionDedupForReconciledEpoch(), after authoritative
+         * reconciliation has completed with both slots EMPTY. It is never
+         * cleared merely because reconnect/resubscribe occurred.
          */
 
         private record PublicOrderId(
@@ -1110,3 +1275,4 @@ public final class QuoterIntegration implements ConnectionListener {
         }
     }
 }
+
