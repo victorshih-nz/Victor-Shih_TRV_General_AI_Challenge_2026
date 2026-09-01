@@ -133,9 +133,9 @@ DESK_HARD_POS = 15
 Mapping:
 
 ```text
-abs(pos) < soft         -> SAFE
-soft <= abs(pos) < hard -> CONTROLLED
-abs(pos) >= hard        -> EMERGENCY
+abs(pos) < soft          -> SAFE
+soft <= abs(pos) < hard  -> CONTROLLED
+abs(pos) >= hard         -> EMERGENCY
 
 SAFE / UNKNOWN -> X
 long risky desk -> S
@@ -211,99 +211,81 @@ Future memo: evaluate bounded JetStream exact-subject catch-up to establish a ne
 
 Deferred: hedge order execution/F sizing, controlled/emergency reduction logic, hedge TPS, oscillation tuning, JetStream accounting reconciliation, profitability tuning.
 
-# 10. Current Micro Task — Job 2.1A
+# 10. Current Micro Task — Job 2.1B-1
 
-Goal: harden existing `hedger/accounting.py` into a production-safe accounting foundation.
+Goal: establish the minimal Hedger runtime configuration and deterministic desk-risk classification foundation.
 
-Reuse `DeskPositionAccounting`. Do not create a second accounting architecture.
+Job 2.1A accounting is CLOSED at commit `120af5f`.
+Do not modify its accounting contract unless a concrete integration defect is found and reviewed first.
 
-Required:
-1. distinguish valid `A/C` from `T/E`
-2. strict `T/E` parsing
-3. sender ownership validation
-4. signed side interpretation
-5. per-sender and desk net position
-6. full dedup key
-7. fail-closed accounting trust
-8. fail-closed dedup-capacity exhaustion
-9. focused tests
-
-Malformed/inconsistent execution evidence must not silently return zero.
-
-Trust-loss cases include malformed `T/E`, invalid qty/side/required fields, wrong sender ownership, unknown sender-specific event, and dedup exhaustion.
-
-Required response:
+Implement:
 
 ```text
-mark accounting untrusted
-raise clear accounting-uncertainty exception
-do not apply uncertain execution
+hedger/hedger.py
+tests/test_hedger_runtime.py
 ```
 
-After trust loss, do not restore trust automatically and do not mutate authoritative position from later executions.
-
-Valid `A/C`:
+Required configuration:
 
 ```text
-delta = 0
-position unchanged
-trust unchanged
+NATS_URL
+TAKER_FEED
+TAKER_SENDER
+SENDER
+HEDGER_SENDER
+DESK_SOFT_POS default 6
+DESK_HARD_POS default 15
 ```
-
-Dedup:
-
-```text
-exact duplicate -> delta 0
-new event within capacity -> apply
-new event when capacity exhausted -> trust lost
-```
-
-Minimum tests:
-- incoming buyer/seller `T`
-- resting buyer/seller `E`
-- T/E ownership validation
-- three-sender aggregation
-- self-trade once per tracked sender
-- exact duplicate ignored
-- same matchId for legitimate distinct sender/event not collapsed
-- valid `A/C` ignored
-- malformed `T/E` -> trust lost
-- ownership mismatch -> trust lost
-- unknown/malformed event -> trust lost
-- dedup exhaustion -> trust lost
-- after trust loss, later execution does not mutate position
-
-Prefer changing only:
-
-```text
-hedger/accounting.py
-tests/test_desk_accounting_baseline.py
-```
-
-A tiny exception type may stay in `accounting.py`.
-
-Do NOT add NATS runtime/subscriptions, metadata/BBO handling, risk publisher/heartbeat, Dockerfile changes, Taker/Quoter changes, hedge orders, startup gate, JetStream replay, or generic frameworks.
 
 Validation:
 
 ```text
-git status --short --branch
-focused Hedger accounting tests
-all existing Python tests
-python compile check where relevant
-git diff --check
-git diff --stat
+TAKER_FEED = exactly 4 chars
+all sender IDs = exactly 8 chars
+Taker / Quoter / Hedger sender IDs must be distinct
+0 < DESK_SOFT_POS < DESK_HARD_POS
 ```
 
-Inspect final diff. Do not commit, push, merge, create PR, or start Job 2.1B.
+Risk mapping:
 
-Return:
-1. files changed
-2. purpose
-3. exact tests
-4. results
-5. git diff --stat
-6. unresolved concern, if any
+```text
+accounting untrusted          -> UNKNOWN X
+
+abs(position) < soft          -> SAFE X
+soft <= abs(position) < hard  -> CONTROLLED
+abs(position) >= hard         -> EMERGENCY
+
+CONTROLLED / EMERGENCY:
+positive position -> S
+negative position -> B
+```
+
+Do NOT implement yet:
+
+```text
+NATS connection
+execution subscriptions
+EX_META access
+BBO subscription
+desk.risk publishing
+heartbeat
+Taker changes
+Quoter changes
+Docker
+hedge orders
+JetStream replay
+```
+
+Validation:
+
+```text
+focused Hedger runtime tests
+all candidate Python tests
+compile check
+git diff --check
+```
+
+Do not commit or begin Job 2.1B-2 until review.
 
 ## 11. Agent rules
 
