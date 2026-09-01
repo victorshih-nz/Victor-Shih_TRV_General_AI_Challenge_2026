@@ -256,7 +256,8 @@ final class OrderRequestClient implements AutoCloseable {
             orderManager.beginAdd(
                 side,
                 orderId,
-                quantity);
+                quantity,
+                price);
         }
 
         String payload =

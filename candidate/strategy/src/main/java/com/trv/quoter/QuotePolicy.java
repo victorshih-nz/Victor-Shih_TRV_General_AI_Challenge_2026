@@ -7,20 +7,8 @@ import java.util.Objects;
 /**
  * V1 Quoter pricing and permission policy.
  *
- * This class is intentionally small and stateful only for EWMA fair value.
- * It does not own order lifecycle state and does not send network requests.
- *
- * Frozen V1 policy:
- * - weighted mid = 80% bid + 20% ask
- * - top-of-book imbalance adjustment bounded to +/- 1 tick
- * - EWMA alpha = 0.2
- * - desk inventory skew bounded to +/- 1.5 ticks
- * - MIN_EDGE = 0.5 tick
- * - improve at most 1 tick, otherwise join, otherwise no quote
- * - SAFE opens a new pair only when both sides are profitable
- * - CONTROLLED permits only the risk-reducing side
- * - EMERGENCY / UNKNOWN do not add exposure
- * - quote clip = 1; max-position normalization = 5
+ * Stateful only for EWMA fair value. It owns no order lifecycle state and
+ * sends no network requests.
  */
 final class QuotePolicy {
 
@@ -43,12 +31,6 @@ final class QuotePolicy {
     private static final int DIVISION_SCALE = 12;
 
     private final Metadata metadata;
-
-    /*
-     * EWMA is intentionally reset on trust loss / reconnect by the integration
-     * layer. The first subsequent valid trusted BBO seeds EWMA directly from
-     * RawFair rather than blending against stale pre-disconnect state.
-     */
     private BigDecimal ewmaFair;
 
     QuotePolicy(Metadata metadata) {
@@ -73,10 +55,7 @@ final class QuotePolicy {
 
         if (!isUsableBbo(bbo)) {
             return QuotePlan.noQuote(
-                HedgerState.UNKNOWN,
-                null,
-                null,
-                null);
+                HedgerState.UNKNOWN);
         }
 
         if (risk == null
@@ -84,10 +63,7 @@ final class QuotePolicy {
                     risk.getFeed())) {
 
             return QuotePlan.noQuote(
-                HedgerState.UNKNOWN,
-                null,
-                null,
-                null);
+                HedgerState.UNKNOWN);
         }
 
         BigDecimal weightedMid =
@@ -162,6 +138,12 @@ final class QuotePolicy {
         HedgerState effectiveRisk =
             effectiveRiskState(risk);
 
+        /*
+         * Candidate prices describe side-level economics and are deliberately
+         * kept separate from new-Add permission. QuoteController needs them to
+         * decide whether an already-resting order can be kept even when SAFE
+         * pair policy suppresses a new one-sided Add.
+         */
         Long bidCandidate =
             chooseBid(
                 bbo,
@@ -172,15 +154,19 @@ final class QuotePolicy {
                 bbo,
                 finalFair);
 
+        boolean bidAllowed = false;
+        boolean askAllowed = false;
+
         Long permittedBid = null;
         Long permittedAsk = null;
 
         switch (effectiveRisk) {
             case SAFE:
+                bidAllowed = true;
+                askAllowed = true;
+
                 /*
-                 * SAFE does not deliberately initiate a directional one-sided
-                 * position. New exposure starts only when both sides satisfy
-                 * profitability.
+                 * Do not intentionally initiate a new one-sided SAFE pair.
                  */
                 if (bidCandidate != null
                         && askCandidate != null) {
@@ -192,16 +178,15 @@ final class QuotePolicy {
 
             case CONTROLLED:
                 /*
-                 * desk.risk hedge direction is the risk-reducing direction.
-                 * Net-position sign is checked as a consistency guard:
-                 *
-                 * positive position -> selling reduces risk
-                 * negative position -> buying reduces risk
+                 * Positive desk position -> selling reduces risk.
+                 * Negative desk position -> buying reduces risk.
+                 * Direction/sign disagreement fails closed.
                  */
                 if (risk.getHedgeDirection()
                             == HedgeDirection.S
                         && risk.getNetPosition() > 0) {
 
+                    askAllowed = true;
                     permittedAsk = askCandidate;
 
                 } else if (
@@ -209,19 +194,23 @@ final class QuotePolicy {
                             == HedgeDirection.B
                         && risk.getNetPosition() < 0) {
 
+                    bidAllowed = true;
                     permittedBid = bidCandidate;
                 }
                 break;
 
             case EMERGENCY:
             case UNKNOWN:
-                // No exposure-increasing Add from the Quoter.
                 break;
         }
 
         return new QuotePlan(
             permittedBid,
             permittedAsk,
+            bidCandidate,
+            askCandidate,
+            bidAllowed,
+            askAllowed,
             weightedMid,
             rawFair,
             ewmaFair,
@@ -229,11 +218,6 @@ final class QuotePolicy {
             effectiveRisk);
     }
 
-    /**
-     * Current resting orders may be kept within one tick of the newly desired
-     * price, but only after the controller independently confirms that the
-     * current order remains safe and profitable.
-     */
     boolean withinKeepTolerance(
             long currentPrice,
             long desiredPrice) {
@@ -291,8 +275,7 @@ final class QuotePolicy {
 
         if (improved.compareTo(
                     bbo.getAskPrice()) < 0
-                && isValidWireQuote(
-                    improved)
+                && isValidWireQuote(improved)
                 && isProfitableBid(
                     improved,
                     finalFair)) {
@@ -326,8 +309,7 @@ final class QuotePolicy {
 
         if (improved.compareTo(
                     bbo.getBidPrice()) > 0
-                && isValidWireQuote(
-                    improved)
+                && isValidWireQuote(improved)
                 && isProfitableAsk(
                     improved,
                     finalFair)) {
@@ -399,10 +381,6 @@ final class QuotePolicy {
                 HedgerState.SAFE;
         }
 
-        /*
-         * Fail closed on disagreement: never downgrade a more severe state
-         * reported by desk.risk, and never ignore a more severe position band.
-         */
         return severity(reported)
                     >= severity(positionDerived)
             ? reported
@@ -467,10 +445,6 @@ final class QuotePolicy {
         try {
             return value.longValueExact();
         } catch (ArithmeticException e) {
-            /*
-             * Protocol prices are integer wire values. A metadata/tick setup
-             * that produces a non-integer candidate is therefore not sent.
-             */
             return null;
         }
     }
@@ -494,6 +468,10 @@ final class QuotePolicy {
     record QuotePlan(
         Long bidPrice,
         Long askPrice,
+        Long bidCandidatePrice,
+        Long askCandidatePrice,
+        boolean bidAllowed,
+        boolean askAllowed,
         BigDecimal weightedMid,
         BigDecimal rawFair,
         BigDecimal ewmaFair,
@@ -501,18 +479,19 @@ final class QuotePolicy {
         HedgerState effectiveRisk) {
 
         static QuotePlan noQuote(
-                HedgerState effectiveRisk,
-                BigDecimal weightedMid,
-                BigDecimal rawFair,
-                BigDecimal finalFair) {
+                HedgerState effectiveRisk) {
 
             return new QuotePlan(
                 null,
                 null,
-                weightedMid,
-                rawFair,
-                rawFair,
-                finalFair,
+                null,
+                null,
+                false,
+                false,
+                null,
+                null,
+                null,
+                null,
                 effectiveRisk);
         }
 
@@ -527,6 +506,30 @@ final class QuotePolicy {
         boolean isTwoSided() {
             return bidPrice != null
                 && askPrice != null;
+        }
+
+        boolean isAllowed(
+                OrderManager.Side side) {
+
+            return side == OrderManager.Side.BID
+                ? bidAllowed
+                : askAllowed;
+        }
+
+        Long candidatePrice(
+                OrderManager.Side side) {
+
+            return side == OrderManager.Side.BID
+                ? bidCandidatePrice
+                : askCandidatePrice;
+        }
+
+        Long addPrice(
+                OrderManager.Side side) {
+
+            return side == OrderManager.Side.BID
+                ? bidPrice
+                : askPrice;
         }
     }
 }

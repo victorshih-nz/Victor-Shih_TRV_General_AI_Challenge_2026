@@ -27,22 +27,73 @@ public class OrderManager {
         private String orderId;
         private int requestedQty;
         private int filledQty;
+        private Long price;
         private UnknownCause unknownCause = UnknownCause.NONE;
     }
 
     private final Slot bid = new Slot();
     private final Slot ask = new Slot();
 
+    /**
+     * Production Add registration.
+     *
+     * Price becomes part of the same authoritative slot state as id/quantity so
+     * the future QuoteController can compare current vs desired without keeping
+     * a shadow order map.
+     */
     public synchronized void beginAdd(
             Side side,
             String orderId,
+            int quantity,
+            long price) {
+
+        beginAddInternal(
+            side,
+            orderId,
+            quantity,
+            price);
+    }
+
+    /**
+     * Temporary compatibility overload for existing lifecycle-only tests and
+     * probes that predate price-aware OrderManager state.
+     *
+     * Production request code MUST use the four-argument overload. An unpriced
+     * occupied slot returns null from price(side), allowing future controller
+     * code to fail closed rather than inventing a price.
+     *
+     * Remove this overload during final Job 1 cleanup after legacy tests/probes
+     * have been migrated to explicit prices.
+     */
+    @Deprecated
+    synchronized void beginAdd(
+            Side side,
+            String orderId,
             int quantity) {
+
+        beginAddInternal(
+            side,
+            orderId,
+            quantity,
+            null);
+    }
+
+    private void beginAddInternal(
+            Side side,
+            String orderId,
+            int quantity,
+            Long price) {
 
         validateInputs(side, orderId);
 
         if (quantity <= 0) {
             throw new IllegalArgumentException(
                     "quantity must be positive");
+        }
+
+        if (price != null && price <= 0L) {
+            throw new IllegalArgumentException(
+                    "price must be positive");
         }
 
         Slot slot = slot(side);
@@ -56,6 +107,7 @@ public class OrderManager {
         slot.orderId = orderId;
         slot.requestedQty = quantity;
         slot.filledQty = 0;
+        slot.price = price;
         slot.unknownCause = UnknownCause.NONE;
     }
 
@@ -265,7 +317,8 @@ public class OrderManager {
         }
 
         /*
-         * Partial fill deliberately preserves lifecycle state:
+         * Partial fill deliberately preserves lifecycle state and original
+         * requested price:
          *
          * PENDING_ADD    -> PENDING_ADD
          * ACTIVE         -> ACTIVE
@@ -301,6 +354,18 @@ public class OrderManager {
     public synchronized String orderId(Side side) {
         validateSide(side);
         return slot(side).orderId;
+    }
+
+    /**
+     * Requested wire price for the current slot.
+     *
+     * Returns null when the slot is EMPTY. It can also be null only for the
+     * temporary legacy three-argument beginAdd overload used by old tests/probes.
+     * Production Add registration always supplies a price.
+     */
+    public synchronized Long price(Side side) {
+        validateSide(side);
+        return slot(side).price;
     }
 
     public synchronized int remainingQty(Side side) {
@@ -348,6 +413,7 @@ public class OrderManager {
         slot.orderId = null;
         slot.requestedQty = 0;
         slot.filledQty = 0;
+        slot.price = null;
         slot.unknownCause = UnknownCause.NONE;
     }
 
