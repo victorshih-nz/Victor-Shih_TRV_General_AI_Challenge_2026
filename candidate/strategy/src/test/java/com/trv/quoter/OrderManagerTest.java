@@ -37,7 +37,7 @@ class OrderManagerTest {
         manager.beginAdd(
                 OrderManager.Side.BID,
                 BID_ID,
-                10);
+                10, 100L);
 
         assertEquals(
                 OrderManager.State.PENDING_ADD,
@@ -59,12 +59,12 @@ class OrderManagerTest {
         manager.beginAdd(
                 OrderManager.Side.BID,
                 BID_ID,
-                10);
+                10, 100L);
 
         manager.beginAdd(
                 OrderManager.Side.ASK,
                 ASK_ID,
-                20);
+                20, 100L);
 
         manager.onResting(
                 OrderManager.Side.BID,
@@ -555,7 +555,7 @@ class OrderManagerTest {
                 () -> manager.beginAdd(
                         OrderManager.Side.BID,
                         BID_ID,
-                        0));
+                        0, 100L));
 
         assertEquals(
                 OrderManager.State.EMPTY,
@@ -571,7 +571,7 @@ class OrderManagerTest {
                 () -> manager.beginAdd(
                         OrderManager.Side.BID,
                         "BID00002",
-                        5));
+                        5, 100L));
 
         assertEquals(
                 BID_ID,
@@ -589,12 +589,12 @@ class OrderManagerTest {
         manager.beginAdd(
                 OrderManager.Side.BID,
                 BID_ID,
-                10);
+                10, 100L);
 
         manager.beginAdd(
                 OrderManager.Side.ASK,
                 ASK_ID,
-                10);
+                10, 100L);
 
         manager.markRequestUncertain(
                 OrderManager.Side.BID,
@@ -615,7 +615,7 @@ class OrderManagerTest {
         manager.beginAdd(
                 OrderManager.Side.BID,
                 BID_ID,
-                quantity);
+                quantity, 100L);
 
         return manager;
     }

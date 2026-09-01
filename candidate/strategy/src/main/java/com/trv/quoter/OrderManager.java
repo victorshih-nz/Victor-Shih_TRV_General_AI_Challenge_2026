@@ -54,30 +54,6 @@ public class OrderManager {
             price);
     }
 
-    /**
-     * Temporary compatibility overload for existing lifecycle-only tests and
-     * probes that predate price-aware OrderManager state.
-     *
-     * Production request code MUST use the four-argument overload. An unpriced
-     * occupied slot returns null from price(side), allowing future controller
-     * code to fail closed rather than inventing a price.
-     *
-     * Remove this overload during final Job 1 cleanup after legacy tests/probes
-     * have been migrated to explicit prices.
-     */
-    @Deprecated
-    synchronized void beginAdd(
-            Side side,
-            String orderId,
-            int quantity) {
-
-        beginAddInternal(
-            side,
-            orderId,
-            quantity,
-            null);
-    }
-
     private void beginAddInternal(
             Side side,
             String orderId,

@@ -72,7 +72,7 @@ class ReconciliationCoordinatorTest {
         f.orders.beginAdd(
             OrderManager.Side.BID,
             "BID00001",
-            10);
+            10, 100L);
         f.orders.markRequestUncertain(
             OrderManager.Side.BID,
             "BID00001");
@@ -96,7 +96,7 @@ class ReconciliationCoordinatorTest {
         f.orders.beginAdd(
             OrderManager.Side.BID,
             "BID00001",
-            10);
+            10, 100L);
         f.orders.markRequestUncertain(
             OrderManager.Side.BID,
             "BID00001");
@@ -142,7 +142,7 @@ class ReconciliationCoordinatorTest {
         f.orders.beginAdd(
             OrderManager.Side.BID,
             "BID00001",
-            10);
+            10, 100L);
         f.orders.markRequestUncertain(
             OrderManager.Side.BID,
             "BID00001");
@@ -186,7 +186,7 @@ class ReconciliationCoordinatorTest {
         f.orders.beginAdd(
             OrderManager.Side.ASK,
             "ASK00001",
-            5);
+            5, 100L);
         f.orders.markRequestUncertain(
             OrderManager.Side.ASK,
             "ASK00001");
@@ -215,7 +215,7 @@ class ReconciliationCoordinatorTest {
         f.orders.beginAdd(
             OrderManager.Side.BID,
             "BID00001",
-            1);
+            1, 100L);
         f.orders.markRequestUncertain(
             OrderManager.Side.BID,
             "BID00001");
@@ -250,7 +250,7 @@ class ReconciliationCoordinatorTest {
         f.orders.beginAdd(
             OrderManager.Side.BID,
             "BID00001",
-            1);
+            1, 100L);
         f.orders.markRequestUncertain(
             OrderManager.Side.BID,
             "BID00001");
@@ -282,7 +282,7 @@ class ReconciliationCoordinatorTest {
         f.orders.beginAdd(
             OrderManager.Side.BID,
             "BID00001",
-            1);
+            1, 100L);
         f.orders.markRequestUncertain(
             OrderManager.Side.BID,
             "BID00001");

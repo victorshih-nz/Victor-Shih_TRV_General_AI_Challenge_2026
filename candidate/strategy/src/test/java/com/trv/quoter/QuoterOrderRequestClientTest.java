@@ -286,7 +286,7 @@ class QuoterOrderRequestClientTest {
             f.manager.beginAdd(
                 OrderManager.Side.ASK,
                 "ASK00001",
-                10);
+                10, 100L);
 
             f.manager.markUnknown(
                 OrderManager.Side.ASK,
@@ -441,7 +441,7 @@ class QuoterOrderRequestClientTest {
             f.manager.beginAdd(
                 OrderManager.Side.BID,
                 "BID00001",
-                10);
+                10, 100L);
 
             f.manager.markRequestUncertain(
                 OrderManager.Side.BID,
@@ -468,7 +468,7 @@ class QuoterOrderRequestClientTest {
         manager.beginAdd(
             OrderManager.Side.ASK,
             orderId,
-            quantity);
+            quantity, 100L);
 
         manager.onResting(
             OrderManager.Side.ASK,

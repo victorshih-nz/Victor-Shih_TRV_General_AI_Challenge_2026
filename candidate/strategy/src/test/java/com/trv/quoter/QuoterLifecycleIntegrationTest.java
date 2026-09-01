@@ -20,7 +20,7 @@ class QuoterLifecycleIntegrationTest {
         manager.beginAdd(
             OrderManager.Side.BID,
             "BID00001",
-            10);
+            10, 100L);
 
         router.accept(md(
             "100 A QUOTE001:BID00001 B 999 500"));
@@ -43,7 +43,7 @@ class QuoterLifecycleIntegrationTest {
         manager.beginAdd(
             OrderManager.Side.BID,
             "BID00001",
-            10);
+            10, 100L);
 
         router.accept(md(
             "100 A QUOTE001:BID00001 B 10 500"));
@@ -70,7 +70,7 @@ class QuoterLifecycleIntegrationTest {
         manager.beginAdd(
             OrderManager.Side.ASK,
             "ASK00001",
-            10);
+            10, 100L);
 
         router.accept(md(
             "100 A QUOTE001:ASK00001 S 10 500"));
@@ -97,7 +97,7 @@ class QuoterLifecycleIntegrationTest {
         manager.beginAdd(
             OrderManager.Side.BID,
             "BID00001",
-            3);
+            3, 100L);
 
         router.accept(md(
             "100 T QUOTE001:BID00001 "
@@ -124,7 +124,7 @@ class QuoterLifecycleIntegrationTest {
         manager.beginAdd(
             OrderManager.Side.BID,
             "BID00001",
-            10);
+            10, 100L);
 
         router.accept(md(
             "100 A QUOTE001:BID00001 B 10 500"));
@@ -150,7 +150,7 @@ class QuoterLifecycleIntegrationTest {
         manager.beginAdd(
             OrderManager.Side.BID,
             "BID00001",
-            10);
+            10, 100L);
 
         router.accept(md(
             "100 A QUOTE001:BID00001 B 10 500"));
@@ -177,12 +177,12 @@ class QuoterLifecycleIntegrationTest {
         manager.beginAdd(
             OrderManager.Side.BID,
             "BID00001",
-            5);
+            5, 100L);
 
         manager.beginAdd(
             OrderManager.Side.ASK,
             "ASK00001",
-            5);
+            5, 100L);
 
         router.accept(md(
             "100 A QUOTE001:BID00001 B 5 500"));
@@ -218,7 +218,7 @@ class QuoterLifecycleIntegrationTest {
         manager.beginAdd(
             OrderManager.Side.ASK,
             "ASK00001",
-            10);
+            10, 100L);
 
         router.accept(md(
             "100 A QUOTE001:ASK00001 S 10 500"));
@@ -244,7 +244,7 @@ class QuoterLifecycleIntegrationTest {
         manager.beginAdd(
             OrderManager.Side.BID,
             "BIDCUR01",
-            10);
+            10, 100L);
 
         router.accept(md(
             "101 T QUOTE001:OLD00001 "
@@ -266,12 +266,12 @@ class QuoterLifecycleIntegrationTest {
         manager.beginAdd(
             OrderManager.Side.BID,
             "BID00001",
-            10);
+            10, 100L);
 
         manager.beginAdd(
             OrderManager.Side.ASK,
             "ASK00001",
-            10);
+            10, 100L);
 
         router.accept(md(
             "not-a-valid-event"));
@@ -294,7 +294,7 @@ class QuoterLifecycleIntegrationTest {
         manager.beginAdd(
             OrderManager.Side.ASK,
             "ASK00001",
-            10);
+            10, 100L);
 
         /*
          * Same current order id, but A claims BUY/BID.
@@ -317,12 +317,12 @@ class QuoterLifecycleIntegrationTest {
         manager.beginAdd(
             OrderManager.Side.BID,
             "BID00001",
-            10);
+            10, 100L);
 
         manager.beginAdd(
             OrderManager.Side.ASK,
             "ASK00001",
-            10);
+            10, 100L);
 
         router.accept(md(
             "100 A QUOTE001:BID00001 B 10 500"));
@@ -355,7 +355,7 @@ class QuoterLifecycleIntegrationTest {
         manager.beginAdd(
             OrderManager.Side.BID,
             "BID00001",
-            10);
+            10, 100L);
 
         router.accept(md(
             "100 A QUOTE001:BID00001 B 10 500"));
@@ -394,7 +394,7 @@ class QuoterLifecycleIntegrationTest {
         manager.beginAdd(
             OrderManager.Side.BID,
             "BID00001",
-            10);
+            10, 100L);
 
         router.accept(md(
             "101 T OTHER001:BUY00001 "
