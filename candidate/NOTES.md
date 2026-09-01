@@ -259,3 +259,157 @@ The two bounded passes returned identical sequence and payload data.
   TPS limiting, and repeated emergency hedging belong to Job 2.2.
 - JetStream desk-accounting replay/reconciliation remains deferred; Job 2.1
   trust loss stays UNKNOWN for the current accounting epoch.
+
+## Job 2.1C — Minimal Taker Fresh-SAFE Gate
+
+### Decisions
+
+- Taker starts fail-closed and may create new exposure only while:
+  - NATS transport is trusted,
+  - the latest `desk.risk.<FEED>` message is valid,
+  - risk state is `SAFE`,
+  - and the risk message is fresh (`< 1000 ms` old).
+- `UNKNOWN`, `CONTROLLED`, `EMERGENCY`, stale risk, malformed risk, or transport
+  disconnect blocks new Taker exposure.
+- Duplicate or older risk sequence numbers are ignored and do not refresh
+  freshness.
+- After risk becomes stale, the old sequence epoch is discarded so a restarted
+  Hedger can establish a new fresh epoch.
+- Taker installs the desk-risk subscription before BBO, flushes both
+  subscriptions, and only then marks transport trusted.
+- Taker checks the gate before signal-to-order conversion and again immediately
+  before order dispatch.
+- Existing Taker order/fill mechanics remain unchanged. Legacy regression tests
+  use an explicit test-only open gate; production code is never given a bypass.
+- Job 2.1C intentionally remains a minimal startup/exposure gate. It does not
+  attempt causal acknowledgement of every Taker execution by Hedger accounting.
+
+### Architecture Review Interaction / Newly Discovered Risk
+
+The live test produced a useful design review rather than a simple
+implementation-and-copy workflow.
+
+1. The first full Python run exposed three legacy regression failures. The new
+   production gate was correctly blocking tests that directly called
+   `Taker.take()` without any Hedger risk. The implementation was not weakened.
+   Instead, the legacy tests were changed to inject a test-only
+   `AlwaysOpenRiskGate`, preserving their original purpose: sender-specific order
+   routing, fill quantity, and buy/sell sign behaviour.
+
+2. The first live startup test showed only Hedger risk messages and no Taker
+   orders even after SAFE. Rather than changing the gate, runtime infrastructure
+   was checked. A direct `ex.bbo.AAH6` probe timed out. This showed that the
+   NATS restart used for the earlier Hedger reconnect test had left
+   Exchange/Simulator without a working BBO flow. `exchange` and `sim` were
+   restarted; five live AAH6 BBO updates were then observed. No production code
+   change was made for this infrastructure issue.
+
+3. The repeated live startup test then passed the intended Job 2.1C invariant:
+   no Taker order was seen before the first SAFE risk, and orders began only
+   after SAFE. However, it also exposed a new race: after the first SAFE message,
+   Taker submitted five F orders within a few milliseconds, before Hedger could
+   incorporate the resulting fills into a changed risk state. Taker finished the
+   run at position `+9`.
+
+4. Reviewer initially proposed a small hardening rule: allow at most one order
+   per Hedger risk sequence. Victor challenged this design with two failure
+   cases:
+   - reject / zero-fill / cancelled orders could interact badly with a one-use
+     authorization model;
+   - more importantly, a newer risk sequence can be only a heartbeat based on
+     the same old accounting state. Therefore `seq=11 > seq=10` does **not**
+     prove that Hedger has incorporated the execution caused by the previous
+     Taker order.
+
+5. The one-sequence/one-order proposal was therefore rejected before being
+   adopted. The important invariant is now explicit:
+
+   **Hedger risk sequence is a publication/heartbeat sequence. It MUST NOT be
+   treated as causal acknowledgement that a previous Taker execution has been
+   accounted for.**
+
+6. Victor then proposed a stronger design combining:
+   - a bounded local pending/in-flight exposure mechanism, and
+   - Hedger publication of an acknowledged Taker position/accounting point.
+
+   Review found this direction substantially stronger, but a correct version
+   must distinguish at least:
+   - request pending,
+   - reject,
+   - accepted zero-fill,
+   - positive immediate fill,
+   - authoritative execution evidence,
+   - Hedger accounting acknowledgement,
+   - timeout/ambiguous outcome,
+   - and transport loss.
+
+   It may also require a separate Hedger accounting acknowledgement/version
+   rather than overloading the existing eight-field `desk.risk` protocol.
+
+7. Because that becomes a broader order-lifecycle and causal-accounting protocol
+   change, the team decided not to expand Job 2.1C further. The risk is recorded
+   and intentionally deferred rather than hidden or patched with a timing-based
+   shortcut.
+
+### Test Evidence
+
+- Focused Taker fresh-SAFE gate tests: 14 tests, PASS.
+- Legacy Taker regression tests: 8 tests, PASS after test-only gate injection.
+- Full candidate Python suite: 65 tests, PASS.
+- `python -m compileall taker hedger tests`: PASS.
+- First live startup attempt:
+  - Hedger SAFE risk flowed correctly.
+  - no Taker orders were observed,
+  - direct BBO probe timed out,
+  - root cause was runtime infrastructure rather than Taker gate logic.
+- After restarting `exchange` and `sim`, live AAH6 BBO updates were restored.
+- Final controlled startup test:
+  - first SAFE observed at `12.387 s`,
+  - first Taker order observed at `12.425 s`,
+  - `orders_before_safe = 0`,
+  - `orders_after_safe = 5`,
+  - `RESULT=PASS`.
+- Taker live run finished with `position=9`, `fills=5`. This result triggered the
+  causal-exposure-pacing review above; it was not treated as evidence that the
+  burst behaviour is fully solved.
+
+### Deferred / Future Work — Causal Taker Exposure Pacing
+
+The newly discovered burst race is deliberately deferred.
+
+Potential future direction:
+
+```text
+fresh SAFE
++ trusted transport
++ no ambiguous request
++ bounded local pending exposure
++ Hedger has causally acknowledged the Taker accounting point
+-> permit next exposure
+```
+
+A future design may track:
+
+- request-pending state,
+- worst-case reserved exposure,
+- Taker local expected position,
+- Hedger acknowledged Taker position or accounting version,
+- and explicit UNKNOWN handling for timeout / ambiguous lifecycle.
+
+Reject and accepted-zero-fill paths should release quickly. Positive fills must
+not release simply because a newer heartbeat sequence arrived. Timeout or
+ambiguous order outcome must fail closed until authoritative evidence resolves
+the uncertainty.
+
+Do **not** implement this future mechanism using `desk.risk` heartbeat sequence
+alone.
+
+### Job 2.1C Scope Decision
+
+Job 2.1C is considered complete for its original scope: prevent Taker exposure
+before fresh Hedger SAFE readiness and fail closed on stale/unsafe risk.
+
+The newly discovered causal-pacing problem is a controlled, documented deferred
+issue. It should be revisited after Job 2.1 integration, or earlier only if new
+runtime evidence shows it must block delivery.
+
