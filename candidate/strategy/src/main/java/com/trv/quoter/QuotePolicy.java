@@ -49,9 +49,38 @@ final class QuotePolicy {
         ewmaFair = null;
     }
 
+    /**
+     * Existing behavior: this call represents a new trusted BBO observation
+     * and therefore advances EWMA.
+     */
     synchronized QuotePlan evaluate(
             Bbo bbo,
             DeskRiskMessage risk) {
+
+        return evaluate(
+            bbo,
+            risk,
+            true);
+    }
+
+    /**
+     * Re-evaluates quoting policy with explicit control over EWMA advancement.
+     *
+     * advanceEwma=true:
+     *   the BBO is a new trusted market observation.
+     *
+     * advanceEwma=false:
+     *   the caller is re-running policy because risk/lifecycle/timer state
+     *   changed while the market observation is unchanged. Inventory/risk
+     *   effects are recomputed, but the same BBO is not counted again in EWMA.
+     *
+     * If EWMA has just been reset, the first usable BBO seeds it even when
+     * advanceEwma=false. This keeps the policy fail-safe after reconnect/reset.
+     */
+    synchronized QuotePlan evaluate(
+            Bbo bbo,
+            DeskRiskMessage risk,
+            boolean advanceEwma) {
 
         if (!isUsableBbo(bbo)) {
             return QuotePlan.noQuote(
@@ -99,7 +128,7 @@ final class QuotePolicy {
 
         if (ewmaFair == null) {
             ewmaFair = rawFair;
-        } else {
+        } else if (advanceEwma) {
             ewmaFair =
                 rawFair.multiply(EWMA_ALPHA)
                     .add(

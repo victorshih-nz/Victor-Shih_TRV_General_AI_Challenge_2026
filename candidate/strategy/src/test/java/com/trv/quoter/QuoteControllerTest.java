@@ -5,6 +5,8 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.Test;
 
 class QuoteControllerTest {
@@ -437,6 +439,224 @@ class QuoteControllerTest {
         assertEquals(
             QuoteController.Action.ADD,
             afterEmpty.bid().action());
+    }
+
+    @Test
+    void automaticEngineDispatchesSafePairWhenRuntimeAndReconciliationAreReady() {
+        OrderManager orders =
+            new OrderManager();
+
+        AtomicLong now =
+            new AtomicLong(
+                1_000_000_000L);
+
+        RuntimeState runtime =
+            new RuntimeState(
+                "AAH6",
+                metadata,
+                now::get);
+
+        runtime.markConnected();
+        runtime.acceptBbo(
+            bbo(
+                100,
+                10,
+                110,
+                10));
+
+        runtime.acceptRisk(
+            risk(
+                0,
+                HedgerState.SAFE,
+                HedgeDirection.X));
+
+        AtomicInteger addCount =
+            new AtomicInteger();
+
+        QuoterIntegration.AutomaticQuoteEngine engine =
+            new QuoterIntegration.AutomaticQuoteEngine(
+                runtime,
+                metadata,
+                orders,
+                () -> true,
+                new Object(),
+                (side, orderId, quantity, price) -> {
+                    addCount.incrementAndGet();
+                    orders.beginAdd(
+                        side,
+                        orderId,
+                        quantity,
+                        price);
+                },
+                side -> {
+                    throw new AssertionError(
+                        "cancel was not expected");
+                },
+                () -> {
+                });
+
+        engine.evaluateOnce();
+
+        assertEquals(
+            2,
+            addCount.get());
+
+        assertEquals(
+            OrderManager.State.PENDING_ADD,
+            orders.state(
+                OrderManager.Side.BID));
+
+        assertEquals(
+            OrderManager.State.PENDING_ADD,
+            orders.state(
+                OrderManager.Side.ASK));
+    }
+
+    @Test
+    void automaticEnginePairSecondAddFailureForcesFirstSideIntoRecovery() {
+        OrderManager orders =
+            new OrderManager();
+
+        AtomicLong now =
+            new AtomicLong(
+                1_000_000_000L);
+
+        RuntimeState runtime =
+            new RuntimeState(
+                "AAH6",
+                metadata,
+                now::get);
+
+        runtime.markConnected();
+        runtime.acceptBbo(
+            bbo(
+                100,
+                10,
+                110,
+                10));
+
+        runtime.acceptRisk(
+            risk(
+                0,
+                HedgerState.SAFE,
+                HedgeDirection.X));
+
+        AtomicInteger recoverySignals =
+            new AtomicInteger();
+
+        QuoterIntegration.AutomaticQuoteEngine engine =
+            new QuoterIntegration.AutomaticQuoteEngine(
+                runtime,
+                metadata,
+                orders,
+                () -> true,
+                new Object(),
+                (side, orderId, quantity, price) -> {
+                    if (side == OrderManager.Side.ASK) {
+                        throw new IllegalStateException(
+                            "simulated second Add failure");
+                    }
+
+                    orders.beginAdd(
+                        side,
+                        orderId,
+                        quantity,
+                        price);
+                },
+                side -> {
+                },
+                recoverySignals::incrementAndGet);
+
+        engine.evaluateOnce();
+
+        assertEquals(
+            OrderManager.State.UNKNOWN,
+            orders.state(
+                OrderManager.Side.BID));
+
+        assertEquals(
+            OrderManager.State.EMPTY,
+            orders.state(
+                OrderManager.Side.ASK));
+
+        assertEquals(
+            1,
+            recoverySignals.get());
+    }
+
+    @Test
+    void automaticEngineCancelsActiveQuoteWhenRiskHeartbeatBecomesStale() {
+        OrderManager orders =
+            new OrderManager();
+
+        active(
+            orders,
+            OrderManager.Side.BID,
+            BID_ID,
+            1,
+            101);
+
+        AtomicLong now =
+            new AtomicLong(
+                1_000_000_000L);
+
+        RuntimeState runtime =
+            new RuntimeState(
+                "AAH6",
+                metadata,
+                now::get);
+
+        runtime.markConnected();
+        runtime.acceptBbo(
+            bbo(
+                100,
+                10,
+                110,
+                10));
+
+        runtime.acceptRisk(
+            risk(
+                0,
+                HedgerState.SAFE,
+                HedgeDirection.X));
+
+        now.addAndGet(
+            1_000_000_001L);
+
+        AtomicInteger cancelCount =
+            new AtomicInteger();
+
+        QuoterIntegration.AutomaticQuoteEngine engine =
+            new QuoterIntegration.AutomaticQuoteEngine(
+                runtime,
+                metadata,
+                orders,
+                () -> true,
+                new Object(),
+                (side, orderId, quantity, price) -> {
+                    throw new AssertionError(
+                        "Add was not expected");
+                },
+                side -> {
+                    cancelCount.incrementAndGet();
+
+                    orders.beginCancel(
+                        side,
+                        orders.orderId(side));
+                },
+                () -> {
+                });
+
+        engine.evaluateOnce();
+
+        assertEquals(
+            1,
+            cancelCount.get());
+
+        assertEquals(
+            OrderManager.State.PENDING_CANCEL,
+            orders.state(
+                OrderManager.Side.BID));
     }
 
     private Fixture fixture() {

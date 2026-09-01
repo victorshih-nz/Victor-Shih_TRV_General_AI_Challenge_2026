@@ -15,6 +15,10 @@ import java.time.Duration;
 import java.util.HashSet;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.function.BooleanSupplier;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -25,6 +29,7 @@ public final class QuoterIntegration implements ConnectionListener {
     private static final int MAX_EXECUTION_DEDUP_ENTRIES = 4096;
     private static final long DEFAULT_ADD_REQUEST_TIMEOUT_MS = 1000L;
     private static final long DEFAULT_CANCEL_REQUEST_TIMEOUT_MS = 1000L;
+    private static final long QUOTE_EVALUATION_INTERVAL_MS = 250L;
 
     private final String feed;
     private final String natsUrl;
@@ -38,10 +43,17 @@ public final class QuoterIntegration implements ConnectionListener {
     private RuntimeState runtimeState;
     private OrderRequestClient orderRequestClient;
     private ReconciliationCoordinator reconciliationCoordinator;
+    private AutomaticQuoteEngine automaticQuoteEngine;
+    private ScheduledExecutorService quoteEvaluationExecutor;
 
     private final Object addRegistrationLock = new Object();
     private final Object bboRecoveryLock = new Object();
+    private final Object quoteSignalLock = new Object();
+
     private boolean liveBboSeen;
+    private boolean quoteEvaluationScheduled;
+    private boolean quoteEvaluationDirty;
+    private volatile boolean quoteEvaluationClosed;
     private volatile boolean subscriptionsReady;
 
     public QuoterIntegration() throws Exception {
@@ -82,6 +94,8 @@ public final class QuoterIntegration implements ConnectionListener {
                     if (coordinator != null) {
                         coordinator.signal();
                     }
+
+                    signalQuoteEvaluation();
                 });
 
         this.liveBboSeen = false;
@@ -232,6 +246,8 @@ public final class QuoterIntegration implements ConnectionListener {
                     if (coordinator != null) {
                         coordinator.signal();
                     }
+
+                    signalQuoteEvaluation();
                 });
 
         reconciliationCoordinator =
@@ -255,6 +271,28 @@ public final class QuoterIntegration implements ConnectionListener {
                     .requestCancel(side));
 
         reconciliationCoordinator.initialize();
+
+        automaticQuoteEngine =
+            new AutomaticQuoteEngine(
+                runtimeState,
+                metadata,
+                orderManager,
+                () -> reconciliationCoordinator != null
+                    && reconciliationCoordinator.isHealthy(),
+                addRegistrationLock,
+                this::requestAdd,
+                this::requestCancel,
+                () -> {
+                    ReconciliationCoordinator coordinator =
+                        reconciliationCoordinator;
+
+                    if (coordinator != null) {
+                        coordinator.signal();
+                    }
+                });
+
+        startQuoteEvaluation();
+        signalQuoteEvaluation();
     }
 
     private void recoverRetainedBbo() {
@@ -276,10 +314,17 @@ public final class QuoterIntegration implements ConnectionListener {
                     Bbo bbo =
                         Bbo.parse(payload, metadata);
 
+                    boolean accepted = false;
+
                     synchronized (bboRecoveryLock) {
                         if (!liveBboSeen) {
                             runtimeState.acceptBbo(bbo);
+                            accepted = true;
                         }
+                    }
+
+                    if (accepted) {
+                        signalQuoteEvaluation();
                     }
                 } catch (Exception e) {
                     logger.log(
@@ -318,6 +363,8 @@ public final class QuoterIntegration implements ConnectionListener {
 
                 logger.warning(
                     "Invalid BBO state: " + payload);
+
+                signalQuoteEvaluation();
                 return;
             }
 
@@ -325,6 +372,8 @@ public final class QuoterIntegration implements ConnectionListener {
                 liveBboSeen = true;
                 runtimeState.acceptBbo(bbo);
             }
+
+            signalQuoteEvaluation();
 
         } catch (Exception e) {
             synchronized (bboRecoveryLock) {
@@ -334,6 +383,8 @@ public final class QuoterIntegration implements ConnectionListener {
 
             logger.warning(
                 "Invalid BBO state: " + e.getMessage());
+
+            signalQuoteEvaluation();
         }
     }
 
@@ -352,6 +403,7 @@ public final class QuoterIntegration implements ConnectionListener {
                 DeskRiskMessage.parse(payload);
 
             runtimeState.acceptRisk(risk);
+            signalQuoteEvaluation();
         } catch (Exception e) {
             logger.warning(
                 "Ignoring malformed risk message: "
@@ -402,6 +454,7 @@ public final class QuoterIntegration implements ConnectionListener {
             runtimeState.resetTrust();
         }
 
+        resetAutomaticQuoteTrust();
         ownLifecycleRouter.markUnknownOnTrustLoss();
 
         synchronized (bboRecoveryLock) {
@@ -418,6 +471,7 @@ public final class QuoterIntegration implements ConnectionListener {
             runtimeState.resetTrust();
         }
 
+        resetAutomaticQuoteTrust();
         ownLifecycleRouter.markUnknownOnTrustLoss();
 
         logger.info("Connection closed");
@@ -430,6 +484,7 @@ public final class QuoterIntegration implements ConnectionListener {
             runtimeState.resetTrust();
         }
 
+        resetAutomaticQuoteTrust();
         ownLifecycleRouter.markUnknownOnTrustLoss();
 
         logger.info("Lame duck mode");
@@ -441,6 +496,8 @@ public final class QuoterIntegration implements ConnectionListener {
         if (runtimeState != null) {
             runtimeState.resetTrust();
         }
+
+        resetAutomaticQuoteTrust();
 
         /*
          * Idempotent after DISCONNECTED. Keeping this here makes trust loss
@@ -467,6 +524,7 @@ public final class QuoterIntegration implements ConnectionListener {
 
                 subscriptionsReady = false;
                 runtimeState.resetTrust();
+                resetAutomaticQuoteTrust();
                 ownLifecycleRouter
                     .markUnknownOnTrustLoss();
                 return;
@@ -483,6 +541,8 @@ public final class QuoterIntegration implements ConnectionListener {
             if (reconciliationCoordinator != null) {
                 reconciliationCoordinator.signal();
             }
+
+            signalQuoteEvaluation();
 
             /*
              * Do NOT clear the Quoter execution dedup set here.
@@ -505,8 +565,186 @@ public final class QuoterIntegration implements ConnectionListener {
                 runtimeState.resetTrust();
             }
 
+            resetAutomaticQuoteTrust();
             ownLifecycleRouter
                 .markUnknownOnTrustLoss();
+        }
+    }
+
+    private void startQuoteEvaluation() {
+        ScheduledExecutorService executor =
+            Executors.newSingleThreadScheduledExecutor(
+                runnable -> {
+                    Thread thread =
+                        new Thread(
+                            runnable,
+                            "quoter-quote-evaluator");
+
+                    thread.setDaemon(true);
+                    return thread;
+                });
+
+        synchronized (quoteSignalLock) {
+            quoteEvaluationClosed = false;
+            quoteEvaluationExecutor = executor;
+        }
+
+        executor.scheduleWithFixedDelay(
+            this::signalQuoteEvaluation,
+            QUOTE_EVALUATION_INTERVAL_MS,
+            QUOTE_EVALUATION_INTERVAL_MS,
+            TimeUnit.MILLISECONDS);
+    }
+
+    private void stopQuoteEvaluation() {
+        ScheduledExecutorService executor;
+
+        synchronized (quoteSignalLock) {
+            quoteEvaluationClosed = true;
+            quoteEvaluationDirty = false;
+            executor = quoteEvaluationExecutor;
+            quoteEvaluationExecutor = null;
+        }
+
+        if (executor != null) {
+            executor.shutdownNow();
+
+            try {
+                executor.awaitTermination(
+                    1L,
+                    TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    private void signalQuoteEvaluation() {
+        ScheduledExecutorService executor;
+
+        synchronized (quoteSignalLock) {
+            if (quoteEvaluationClosed) {
+                return;
+            }
+
+            quoteEvaluationDirty = true;
+
+            if (quoteEvaluationScheduled
+                    || quoteEvaluationExecutor == null) {
+
+                return;
+            }
+
+            quoteEvaluationScheduled = true;
+            executor = quoteEvaluationExecutor;
+        }
+
+        try {
+            executor.execute(
+                this::drainQuoteEvaluations);
+        } catch (RuntimeException e) {
+            boolean closed;
+
+            synchronized (quoteSignalLock) {
+                quoteEvaluationScheduled = false;
+                closed = quoteEvaluationClosed;
+            }
+
+            if (!closed) {
+                failClosedQuoteEvaluation(
+                    "failed to schedule quote evaluation",
+                    e);
+            }
+        }
+    }
+
+    private void drainQuoteEvaluations() {
+        while (true) {
+            synchronized (quoteSignalLock) {
+                if (quoteEvaluationClosed) {
+                    quoteEvaluationScheduled = false;
+                    quoteEvaluationDirty = false;
+                    return;
+                }
+
+                if (!quoteEvaluationDirty) {
+                    quoteEvaluationScheduled = false;
+                    return;
+                }
+
+                quoteEvaluationDirty = false;
+            }
+
+            try {
+                AutomaticQuoteEngine engine =
+                    automaticQuoteEngine;
+
+                if (engine != null) {
+                    engine.evaluateOnce();
+                }
+            } catch (RuntimeException e) {
+                failClosedQuoteEvaluation(
+                    "unexpected automatic quote evaluation failure",
+                    e);
+            }
+        }
+    }
+
+    private void resetAutomaticQuoteTrust() {
+        AutomaticQuoteEngine engine =
+            automaticQuoteEngine;
+
+        if (engine != null) {
+            engine.resetTrust();
+        }
+
+        signalQuoteEvaluation();
+    }
+
+    private void failClosedQuoteEvaluation(
+            String reason,
+            Throwable error) {
+
+        logger.log(
+            Level.SEVERE,
+            reason,
+            error);
+
+        synchronized (orderManager) {
+            markCurrentQuoteUnknown(
+                OrderManager.Side.BID);
+
+            markCurrentQuoteUnknown(
+                OrderManager.Side.ASK);
+        }
+
+        ReconciliationCoordinator coordinator =
+            reconciliationCoordinator;
+
+        if (coordinator != null) {
+            coordinator.signal();
+        }
+    }
+
+    private void markCurrentQuoteUnknown(
+            OrderManager.Side side) {
+
+        OrderManager.State state =
+            orderManager.state(side);
+
+        if (state == OrderManager.State.EMPTY
+                || state == OrderManager.State.UNKNOWN) {
+
+            return;
+        }
+
+        String orderId =
+            orderManager.orderId(side);
+
+        if (orderId != null) {
+            orderManager.markUnknown(
+                side,
+                orderId);
         }
     }
 
@@ -553,8 +791,9 @@ public final class QuoterIntegration implements ConnectionListener {
     }
 
     /*
-     * Foundation request primitive only.
-     * Profitability and inventory policy are intentionally deferred.
+     * Exact Add primitive used by the automatic quote engine and focused
+     * tests. Pricing/profitability/inventory policy is decided before this
+     * request layer.
      */
     public void requestAdd(
             OrderManager.Side side,
@@ -598,6 +837,8 @@ public final class QuoterIntegration implements ConnectionListener {
     }
 
     public void close() throws Exception {
+        stopQuoteEvaluation();
+
         if (reconciliationCoordinator != null) {
             reconciliationCoordinator.close();
         }
@@ -692,6 +933,635 @@ public final class QuoterIntegration implements ConnectionListener {
         }
 
         return Metadata.parse(feed, payload);
+    }
+
+    /**
+     * Serialized production quote orchestrator.
+     *
+     * QuotePolicy remains the pricing/risk domain policy.
+     * QuoteController remains the pure lifecycle decision layer.
+     * This integration-layer component only turns those decisions into
+     * Add/Cancel side effects and contains the non-atomic SAFE pair safeguard.
+     */
+    static final class AutomaticQuoteEngine {
+
+        @FunctionalInterface
+        interface AddAction {
+            void add(
+                OrderManager.Side side,
+                String orderId,
+                int quantity,
+                long price);
+        }
+
+        @FunctionalInterface
+        interface CancelAction {
+            void cancel(
+                OrderManager.Side side);
+        }
+
+        private final RuntimeState runtimeState;
+        private final QuotePolicy quotePolicy;
+        private final QuoteController quoteController;
+        private final OrderManager orderManager;
+        private final OrderIdGenerator orderIdGenerator;
+        private final BooleanSupplier reconciliationHealthy;
+        private final Object addRegistrationLock;
+        private final AddAction addAction;
+        private final CancelAction cancelAction;
+        private final Runnable recoverySignal;
+
+        private long lastEvaluatedBboVersion =
+            Long.MIN_VALUE;
+
+        AutomaticQuoteEngine(
+                RuntimeState runtimeState,
+                Metadata metadata,
+                OrderManager orderManager,
+                BooleanSupplier reconciliationHealthy,
+                Object addRegistrationLock,
+                AddAction addAction,
+                CancelAction cancelAction,
+                Runnable recoverySignal) {
+
+            this.runtimeState =
+                Objects.requireNonNull(
+                    runtimeState,
+                    "runtimeState is required");
+
+            this.orderManager =
+                Objects.requireNonNull(
+                    orderManager,
+                    "orderManager is required");
+
+            this.quotePolicy =
+                new QuotePolicy(
+                    Objects.requireNonNull(
+                        metadata,
+                        "metadata is required"));
+
+            this.quoteController =
+                new QuoteController(
+                    quotePolicy,
+                    orderManager);
+
+            this.orderIdGenerator =
+                new OrderIdGenerator();
+
+            this.reconciliationHealthy =
+                Objects.requireNonNull(
+                    reconciliationHealthy,
+                    "reconciliationHealthy is required");
+
+            this.addRegistrationLock =
+                Objects.requireNonNull(
+                    addRegistrationLock,
+                    "addRegistrationLock is required");
+
+            this.addAction =
+                Objects.requireNonNull(
+                    addAction,
+                    "addAction is required");
+
+            this.cancelAction =
+                Objects.requireNonNull(
+                    cancelAction,
+                    "cancelAction is required");
+
+            this.recoverySignal =
+                Objects.requireNonNull(
+                    recoverySignal,
+                    "recoverySignal is required");
+        }
+
+        synchronized void resetTrust() {
+            quotePolicy.reset();
+            lastEvaluatedBboVersion =
+                Long.MIN_VALUE;
+        }
+
+        synchronized void evaluateOnce() {
+            /*
+             * During reconciliation the coordinator owns order reduction and
+             * replay. Do not race it with new quote decisions.
+             */
+            if (!reconciliationHealthy
+                    .getAsBoolean()) {
+
+                return;
+            }
+
+            RuntimeState.Snapshot snapshot =
+                runtimeState.snapshot();
+
+            QuotePolicy.QuotePlan plan;
+
+            if (!snapshot.ready()) {
+                /*
+                 * WAITING market/risk state means existing ACTIVE quotes are
+                 * no longer safe to keep. QuoteController converts this
+                 * no-permission plan into CANCEL for ACTIVE slots while
+                 * PENDING/UNKNOWN lifecycle stays fail-closed.
+                 */
+                plan =
+                    QuotePolicy.QuotePlan.noQuote(
+                        HedgerState.UNKNOWN);
+            } else {
+                boolean newBboObservation =
+                    snapshot.bboVersion()
+                        != lastEvaluatedBboVersion;
+
+                plan =
+                    quotePolicy.evaluate(
+                        snapshot.bbo(),
+                        snapshot.risk(),
+                        newBboObservation);
+
+                lastEvaluatedBboVersion =
+                    snapshot.bboVersion();
+            }
+
+            QuoteController.Decision decision =
+                quoteController.decide(plan);
+
+            executeCancel(
+                OrderManager.Side.BID,
+                decision.bid());
+
+            executeCancel(
+                OrderManager.Side.ASK,
+                decision.ask());
+
+            /*
+             * QuoteController already suppresses ADD whenever a cancel or busy
+             * lifecycle exists. Revalidate the runtime snapshot anyway so a
+             * BBO/risk change that raced this evaluation can never create
+             * exposure from stale inputs.
+             */
+            if (!hasAdd(decision)
+                    || !snapshot.ready()
+                    || !reconciliationHealthy
+                        .getAsBoolean()) {
+
+                return;
+            }
+
+            RuntimeState.Snapshot latest =
+                runtimeState.snapshot();
+
+            if (!latest.ready()
+                    || latest.bboVersion()
+                        != snapshot.bboVersion()
+                    || latest.riskVersion()
+                        != snapshot.riskVersion()
+                    || !reconciliationHealthy
+                        .getAsBoolean()) {
+
+                return;
+            }
+
+            boolean bidAdd =
+                decision.bid().action()
+                    == QuoteController.Action.ADD;
+
+            boolean askAdd =
+                decision.ask().action()
+                    == QuoteController.Action.ADD;
+
+            if (bidAdd && askAdd) {
+                dispatchSafePair(
+                    decision,
+                    latest.risk());
+                return;
+            }
+
+            if (bidAdd) {
+                dispatchSingleAdd(
+                    OrderManager.Side.BID,
+                    decision.bid());
+            }
+
+            if (askAdd) {
+                dispatchSingleAdd(
+                    OrderManager.Side.ASK,
+                    decision.ask());
+            }
+        }
+
+        private void executeCancel(
+                OrderManager.Side side,
+                QuoteController.SideDecision decision) {
+
+            if (decision.action()
+                    != QuoteController.Action.CANCEL) {
+
+                return;
+            }
+
+            try {
+                cancelAction.cancel(side);
+            } catch (RuntimeException e) {
+                OrderManager.State current =
+                    orderManager.state(side);
+
+                if (current == OrderManager.State.EMPTY
+                        || current
+                            == OrderManager.State.PENDING_CANCEL
+                        || current
+                            == OrderManager.State.UNKNOWN) {
+
+                    return;
+                }
+
+                forceRecoveryForCurrent(
+                    side,
+                    orderManager.orderId(side),
+                    "automatic quote cancel failed",
+                    e);
+            }
+        }
+
+        private boolean hasAdd(
+                QuoteController.Decision decision) {
+
+            return decision.bid().action()
+                        == QuoteController.Action.ADD
+                || decision.ask().action()
+                        == QuoteController.Action.ADD;
+        }
+
+        private void dispatchSingleAdd(
+                OrderManager.Side side,
+                QuoteController.SideDecision decision) {
+
+            Long price =
+                decision.price();
+
+            if (price == null) {
+                throw new IllegalStateException(
+                    "ADD decision has no price");
+            }
+
+            String orderId =
+                orderIdGenerator.nextId();
+
+            try {
+                addAction.add(
+                    side,
+                    orderId,
+                    QuotePolicy.QUOTE_CLIP,
+                    price);
+            } catch (RuntimeException e) {
+                forceRecoveryForCurrent(
+                    side,
+                    orderId,
+                    "automatic quote Add failed",
+                    e);
+                return;
+            }
+
+            if (isCurrentUnknown(
+                    side,
+                    orderId)) {
+
+                recoverySignal.run();
+            }
+        }
+
+        private void dispatchSafePair(
+                QuoteController.Decision decision,
+                DeskRiskMessage risk) {
+
+            OrderManager.Side first =
+                preferredFirstSide(risk);
+
+            OrderManager.Side second =
+                opposite(first);
+
+            QuoteController.SideDecision
+                firstDecision =
+                    decisionFor(
+                        decision,
+                        first);
+
+            QuoteController.SideDecision
+                secondDecision =
+                    decisionFor(
+                        decision,
+                        second);
+
+            Long firstPrice =
+                firstDecision.price();
+
+            Long secondPrice =
+                secondDecision.price();
+
+            if (firstPrice == null
+                    || secondPrice == null) {
+
+                throw new IllegalStateException(
+                    "SAFE pair ADD decision is missing a price");
+            }
+
+            /*
+             * The exchange protocol has no atomic two-order request. Serialize
+             * both Add registrations against the same exposure-floor lock.
+             *
+             * At non-zero SAFE inventory, send the risk-reducing side first.
+             * At zero inventory BID is the deterministic first side.
+             */
+            synchronized (addRegistrationLock) {
+                String firstId =
+                    orderIdGenerator.nextId();
+
+                try {
+                    addAction.add(
+                        first,
+                        firstId,
+                        QuotePolicy.QUOTE_CLIP,
+                        firstPrice);
+                } catch (RuntimeException e) {
+                    forceRecoveryForCurrent(
+                        first,
+                        firstId,
+                        "first SAFE pair Add failed",
+                        e);
+                    return;
+                }
+
+                if (!isLiveAddState(
+                        first,
+                        firstId)) {
+
+                    if (isCurrentOccupied(
+                            first,
+                            firstId)) {
+
+                        forceRecoveryForCurrent(
+                            first,
+                            firstId,
+                            "first SAFE pair Add did not remain live",
+                            null);
+                    }
+
+                    return;
+                }
+
+                String secondId =
+                    orderIdGenerator.nextId();
+
+                try {
+                    addAction.add(
+                        second,
+                        secondId,
+                        QuotePolicy.QUOTE_CLIP,
+                        secondPrice);
+                } catch (RuntimeException e) {
+                    abortPairToRecovery(
+                        first,
+                        firstId,
+                        second,
+                        secondId,
+                        "second SAFE pair Add failed",
+                        e);
+                    return;
+                }
+
+                /*
+                 * A/T/C can race either request. A successful pair handoff
+                 * requires both sides to remain PENDING_ADD or ACTIVE after the
+                 * second dispatch. Otherwise deliberately stop quoting and let
+                 * exact-cancel/replay reconciliation flatten the orphan.
+                 */
+                if (!isLiveAddState(
+                        first,
+                        firstId)
+                        || !isLiveAddState(
+                            second,
+                            secondId)) {
+
+                    abortPairToRecovery(
+                        first,
+                        firstId,
+                        second,
+                        secondId,
+                        "SAFE pair became asymmetric during dispatch",
+                        null);
+                }
+            }
+        }
+
+        private OrderManager.Side preferredFirstSide(
+                DeskRiskMessage risk) {
+
+            if (risk != null
+                    && risk.getNetPosition() > 0) {
+
+                return OrderManager.Side.ASK;
+            }
+
+            if (risk != null
+                    && risk.getNetPosition() < 0) {
+
+                return OrderManager.Side.BID;
+            }
+
+            return OrderManager.Side.BID;
+        }
+
+        private QuoteController.SideDecision decisionFor(
+                QuoteController.Decision decision,
+                OrderManager.Side side) {
+
+            return side == OrderManager.Side.BID
+                ? decision.bid()
+                : decision.ask();
+        }
+
+        private OrderManager.Side opposite(
+                OrderManager.Side side) {
+
+            return side == OrderManager.Side.BID
+                ? OrderManager.Side.ASK
+                : OrderManager.Side.BID;
+        }
+
+        private boolean isLiveAddState(
+                OrderManager.Side side,
+                String orderId) {
+
+            synchronized (orderManager) {
+                if (!isCurrent(
+                        side,
+                        orderId)) {
+
+                    return false;
+                }
+
+                OrderManager.State state =
+                    orderManager.state(side);
+
+                return state
+                        == OrderManager.State.PENDING_ADD
+                    || state
+                        == OrderManager.State.ACTIVE;
+            }
+        }
+
+        private boolean isCurrentUnknown(
+                OrderManager.Side side,
+                String orderId) {
+
+            synchronized (orderManager) {
+                return isCurrent(
+                        side,
+                        orderId)
+                    && orderManager.state(side)
+                        == OrderManager.State.UNKNOWN;
+            }
+        }
+
+        private boolean isCurrentOccupied(
+                OrderManager.Side side,
+                String orderId) {
+
+            synchronized (orderManager) {
+                return isCurrent(
+                    side,
+                    orderId)
+                    && orderManager.state(side)
+                        != OrderManager.State.EMPTY;
+            }
+        }
+
+        private boolean isCurrent(
+                OrderManager.Side side,
+                String orderId) {
+
+            String current =
+                orderManager.orderId(side);
+
+            return orderId != null
+                && orderId.equals(current);
+        }
+
+        private void abortPairToRecovery(
+                OrderManager.Side first,
+                String firstId,
+                OrderManager.Side second,
+                String secondId,
+                String reason,
+                Throwable error) {
+
+            boolean changed = false;
+
+            changed |=
+                markCurrentUnknown(
+                    first,
+                    firstId);
+
+            changed |=
+                markCurrentUnknown(
+                    second,
+                    secondId);
+
+            if (changed
+                    || isCurrentOccupied(
+                        first,
+                        firstId)
+                    || isCurrentOccupied(
+                        second,
+                        secondId)) {
+
+                recoverySignal.run();
+            }
+
+            logPairAbort(
+                reason,
+                error);
+        }
+
+        private void forceRecoveryForCurrent(
+                OrderManager.Side side,
+                String orderId,
+                String reason,
+                Throwable error) {
+
+            boolean changed =
+                markCurrentUnknown(
+                    side,
+                    orderId);
+
+            if (changed
+                    || isCurrentOccupied(
+                        side,
+                        orderId)) {
+
+                recoverySignal.run();
+            }
+
+            if (error == null) {
+                logger.warning(
+                    reason
+                        + " side="
+                        + side
+                        + " orderId="
+                        + orderId);
+            } else {
+                logger.log(
+                    Level.WARNING,
+                    reason
+                        + " side="
+                        + side
+                        + " orderId="
+                        + orderId,
+                    error);
+            }
+        }
+
+        private boolean markCurrentUnknown(
+                OrderManager.Side side,
+                String orderId) {
+
+            synchronized (orderManager) {
+                if (!isCurrent(
+                        side,
+                        orderId)) {
+
+                    return false;
+                }
+
+                OrderManager.State state =
+                    orderManager.state(side);
+
+                if (state == OrderManager.State.EMPTY
+                        || state
+                            == OrderManager.State.UNKNOWN) {
+
+                    return false;
+                }
+
+                orderManager.markUnknown(
+                    side,
+                    orderId);
+
+                return true;
+            }
+        }
+
+        private void logPairAbort(
+                String reason,
+                Throwable error) {
+
+            if (error == null) {
+                logger.warning(reason);
+            } else {
+                logger.log(
+                    Level.WARNING,
+                    reason,
+                    error);
+            }
+        }
     }
 
     /*

@@ -371,6 +371,144 @@ class QuotePolicyTest {
                 new BigDecimal("100.5")));
     }
 
+    @Test
+    void reevaluationOfSameMarketDoesNotAdvanceEwma() {
+        QuotePolicy policy =
+            new QuotePolicy(metadata);
+
+        QuotePolicy.QuotePlan first =
+            policy.evaluate(
+                bbo(
+                    100,
+                    10,
+                    110,
+                    10),
+                risk(
+                    0,
+                    HedgerState.SAFE,
+                    HedgeDirection.X),
+                true);
+
+        assertBigDecimal(
+            "102.0",
+            first.ewmaFair());
+
+        QuotePolicy.QuotePlan reevaluated =
+            policy.evaluate(
+                bbo(
+                    110,
+                    10,
+                    120,
+                    10),
+                risk(
+                    3,
+                    HedgerState.CONTROLLED,
+                    HedgeDirection.S),
+                false);
+
+        /*
+        * Same market observation must not advance EWMA.
+        */
+        assertBigDecimal(
+            "102.0",
+            reevaluated.ewmaFair());
+
+        /*
+        * Inventory still updates:
+        * +3 / 5 * -1.5 tick = -0.9 tick
+        */
+        assertBigDecimal(
+            "101.10",
+            reevaluated.finalFair());
+    }
+
+    @Test
+    void genuineNewBboAdvancesEwmaAfterNonAdvancingReevaluation() {
+        QuotePolicy policy =
+            new QuotePolicy(metadata);
+
+        policy.evaluate(
+            bbo(
+                100,
+                10,
+                110,
+                10),
+            risk(
+                0,
+                HedgerState.SAFE,
+                HedgeDirection.X),
+            true);
+
+        policy.evaluate(
+            bbo(
+                110,
+                10,
+                120,
+                10),
+            risk(
+                0,
+                HedgerState.SAFE,
+                HedgeDirection.X),
+            false);
+
+        QuotePolicy.QuotePlan next =
+            policy.evaluate(
+                bbo(
+                    110,
+                    10,
+                    120,
+                    10),
+                risk(
+                    0,
+                    HedgerState.SAFE,
+                    HedgeDirection.X),
+                true);
+
+        /*
+        * 0.2 * 112 + 0.8 * 102 = 104
+        */
+        assertBigDecimal(
+            "104.00",
+            next.ewmaFair());
+    }
+
+    @Test
+    void firstUsableBboSeedsAfterResetEvenForNonAdvancingEvaluation() {
+        QuotePolicy policy =
+            new QuotePolicy(metadata);
+
+        policy.evaluate(
+            bbo(
+                100,
+                10,
+                110,
+                10),
+            risk(
+                0,
+                HedgerState.SAFE,
+                HedgeDirection.X),
+            true);
+
+        policy.reset();
+
+        QuotePolicy.QuotePlan seeded =
+            policy.evaluate(
+                bbo(
+                    110,
+                    10,
+                    120,
+                    10),
+                risk(
+                    0,
+                    HedgerState.SAFE,
+                    HedgeDirection.X),
+                false);
+
+        assertBigDecimal(
+            "112.0",
+            seeded.ewmaFair());
+    }
+
     private Bbo bbo(
             long bid,
             long bidQty,

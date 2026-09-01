@@ -14,14 +14,21 @@ public final class RuntimeState {
     private boolean connectionTrusted;
 
     private Bbo trustedBbo;
+    private long bboVersion;
 
     private DeskRiskMessage trustedRisk;
     private long riskReceivedAtNs;
-
     private Long lastAcceptedRiskSeq;
+    private long riskVersion;
 
-    public RuntimeState(String feed, Metadata metadata) {
-        this(feed, metadata, System::nanoTime);
+    public RuntimeState(
+            String feed,
+            Metadata metadata) {
+
+        this(
+            feed,
+            metadata,
+            System::nanoTime);
     }
 
     RuntimeState(
@@ -29,17 +36,28 @@ public final class RuntimeState {
             Metadata metadata,
             LongSupplier nanoClock) {
 
-        if (feed == null || feed.isBlank()) {
-            throw new IllegalArgumentException("feed is required");
+        if (feed == null
+                || feed.isBlank()) {
+
+            throw new IllegalArgumentException(
+                "feed is required");
         }
 
         this.feed = feed;
-        this.metadata = Objects.requireNonNull(metadata, "metadata");
-        this.nanoClock = Objects.requireNonNull(nanoClock, "nanoClock");
+        this.metadata =
+            Objects.requireNonNull(
+                metadata,
+                "metadata");
+        this.nanoClock =
+            Objects.requireNonNull(
+                nanoClock,
+                "nanoClock");
 
-        if (!feed.equals(metadata.getFeed())) {
+        if (!feed.equals(
+                metadata.getFeed())) {
+
             throw new IllegalArgumentException(
-                    "feed does not match metadata feed");
+                "feed does not match metadata feed");
         }
 
         resetTrust();
@@ -53,66 +71,119 @@ public final class RuntimeState {
         connectionTrusted = false;
 
         trustedBbo = null;
+        bboVersion++;
 
         trustedRisk = null;
         riskReceivedAtNs = 0L;
-
         lastAcceptedRiskSeq = null;
+        riskVersion++;
     }
 
-    public synchronized void acceptBbo(Bbo bbo) {
-        if (bbo == null || !bbo.isValid(metadata)) {
+    public synchronized void acceptBbo(
+            Bbo bbo) {
+
+        if (bbo == null
+                || !bbo.isValid(metadata)) {
+
             return;
         }
 
         trustedBbo = bbo;
+        bboVersion++;
     }
 
     public synchronized void invalidateBbo() {
-        trustedBbo = null;
+        if (trustedBbo != null) {
+            trustedBbo = null;
+            bboVersion++;
+        }
     }
 
-    public synchronized void acceptRisk(DeskRiskMessage risk) {
+    public synchronized void acceptRisk(
+            DeskRiskMessage risk) {
+
         if (risk == null) {
             return;
         }
 
-        if (!feed.equals(risk.getFeed())) {
+        if (!feed.equals(
+                risk.getFeed())) {
+
             return;
         }
 
         if (lastAcceptedRiskSeq != null
-                && risk.getSequence() <= lastAcceptedRiskSeq) {
+                && risk.getSequence()
+                    <= lastAcceptedRiskSeq) {
+
             return;
         }
 
         trustedRisk = risk;
-        riskReceivedAtNs = nanoClock.getAsLong();
-        lastAcceptedRiskSeq = risk.getSequence();
+        riskReceivedAtNs =
+            nanoClock.getAsLong();
+        lastAcceptedRiskSeq =
+            risk.getSequence();
+        riskVersion++;
+    }
+
+    /**
+     * Returns one internally consistent view of the trusted market/risk state.
+     *
+     * The snapshot also performs the same risk-freshness check as isReady().
+     * Therefore a periodic evaluator can detect risk expiry even when no new
+     * BBO or risk message arrives.
+     *
+     * bboVersion changes only when trusted BBO state changes. It lets the quote
+     * evaluator distinguish a genuinely new market observation from a
+     * risk/lifecycle/timer re-evaluation of the same BBO.
+     */
+    public synchronized Snapshot snapshot() {
+        expireStaleRiskIfNeeded();
+
+        boolean ready =
+            connectionTrusted
+                && trustedBbo != null
+                && trustedBbo.isValid(metadata)
+                && trustedRisk != null
+                && trustedRisk.getState()
+                    != HedgerState.UNKNOWN;
+
+        return new Snapshot(
+            trustedBbo,
+            trustedRisk,
+            ready,
+            bboVersion,
+            riskVersion);
     }
 
     public synchronized boolean isReady() {
-        if (!connectionTrusted) {
-            return false;
+        return snapshot().ready();
+    }
+
+    private void expireStaleRiskIfNeeded() {
+        if (trustedRisk == null) {
+            return;
         }
 
-        long now = nanoClock.getAsLong();
+        long now =
+            nanoClock.getAsLong();
 
-        if (trustedRisk != null
-                && now - riskReceivedAtNs > RISK_STALE_NS) {
+        if (now - riskReceivedAtNs
+                > RISK_STALE_NS) {
+
             trustedRisk = null;
             riskReceivedAtNs = 0L;
             lastAcceptedRiskSeq = null;
+            riskVersion++;
         }
+    }
 
-        if (trustedBbo == null || !trustedBbo.isValid(metadata)) {
-            return false;
-        }
-
-        if (trustedRisk == null) {
-            return false;
-        }
-
-        return trustedRisk.getState() != HedgerState.UNKNOWN;
+    public record Snapshot(
+        Bbo bbo,
+        DeskRiskMessage risk,
+        boolean ready,
+        long bboVersion,
+        long riskVersion) {
     }
 }

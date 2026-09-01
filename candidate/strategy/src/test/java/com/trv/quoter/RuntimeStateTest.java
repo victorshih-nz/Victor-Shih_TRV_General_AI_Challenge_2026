@@ -194,4 +194,154 @@ public class RuntimeStateTest {
 
         assertFalse(runtimeState.isReady());
     }
+
+    @Test
+    void snapshotReturnsConsistentTrustedBboRiskAndReadyState() {
+        AtomicLong now =
+            new AtomicLong(
+                1_000_000_000L);
+
+        Metadata metadata =
+            Metadata.parse(
+                "AAH6",
+                "ticksize=1");
+
+        RuntimeState state =
+            new RuntimeState(
+                "AAH6",
+                metadata,
+                now::get);
+
+        Bbo bbo =
+            Bbo.parse(
+                "1 AAH6 100 10 110 10",
+                metadata);
+
+        DeskRiskMessage risk =
+            risk(
+                1L,
+                HedgerState.SAFE,
+                HedgeDirection.X);
+
+        state.markConnected();
+        state.acceptBbo(bbo);
+        state.acceptRisk(risk);
+
+        RuntimeState.Snapshot snapshot =
+            state.snapshot();
+
+        assertTrue(snapshot.ready());
+        assertSame(bbo, snapshot.bbo());
+        assertSame(risk, snapshot.risk());
+    }
+
+    @Test
+    void bboVersionChangesForAcceptedBboButNotForRiskOnlyUpdate() {
+        AtomicLong now =
+            new AtomicLong(
+                1_000_000_000L);
+
+        Metadata metadata =
+            Metadata.parse(
+                "AAH6",
+                "ticksize=1");
+
+        RuntimeState state =
+            new RuntimeState(
+                "AAH6",
+                metadata,
+                now::get);
+
+        long initial =
+            state.snapshot()
+                .bboVersion();
+
+        state.acceptBbo(
+            Bbo.parse(
+                "1 AAH6 100 10 110 10",
+                metadata));
+
+        long afterBbo =
+            state.snapshot()
+                .bboVersion();
+
+        state.acceptRisk(
+            risk(
+                1L,
+                HedgerState.SAFE,
+                HedgeDirection.X));
+
+        long afterRisk =
+            state.snapshot()
+                .bboVersion();
+
+        assertTrue(afterBbo > initial);
+        assertEquals(
+            afterBbo,
+            afterRisk);
+    }
+
+    @Test
+    void snapshotExpiresStaleRiskWithoutDiscardingTrustedBbo() {
+        AtomicLong now =
+            new AtomicLong(
+                1_000_000_000L);
+
+        Metadata metadata =
+            Metadata.parse(
+                "AAH6",
+                "ticksize=1");
+
+        RuntimeState state =
+            new RuntimeState(
+                "AAH6",
+                metadata,
+                now::get);
+
+        Bbo bbo =
+            Bbo.parse(
+                "1 AAH6 100 10 110 10",
+                metadata);
+
+        state.markConnected();
+        state.acceptBbo(bbo);
+        state.acceptRisk(
+            risk(
+                10L,
+                HedgerState.SAFE,
+                HedgeDirection.X));
+
+        long riskVersionBefore =
+            state.snapshot()
+                .riskVersion();
+
+        now.addAndGet(
+            1_000_000_001L);
+
+        RuntimeState.Snapshot stale =
+            state.snapshot();
+
+        assertFalse(stale.ready());
+        assertSame(bbo, stale.bbo());
+        assertNull(stale.risk());
+        assertTrue(
+            stale.riskVersion()
+                > riskVersionBefore);
+    }
+
+    private DeskRiskMessage risk(
+            long sequence,
+            HedgerState state,
+            HedgeDirection direction) {
+
+        return new DeskRiskMessage(
+            1L,
+            sequence,
+            "AAH6",
+            0,
+            4,
+            5,
+            state,
+            direction);
+    }
 }
