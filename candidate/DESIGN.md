@@ -2,14 +2,19 @@
 
 Active implementation contract.
 
-Source of truth:
+Source hierarchy:
+- `TASK.md` = official requirement
 - `PROTOCOL.md` = wire protocol
 - `DESIGN.md` = active invariants/current task
-- `NOTES.md` = completed evidence/history
+- `NOTES.md` = evidence/history
+
+If DESIGN conflicts with runtime evidence, stop and report before changing production code.
 
 ## 1. Scope / priorities
 
-V1: one `TAKER_FEED`; Taker Python, Quoter Java, Hedger Python.
+V1 trades one `TAKER_FEED`.
+
+Seats: Taker = Python legacy; Quoter = Java liquidity provider; Hedger = Python desk-risk authority.
 
 ```text
 Capital preservation
@@ -19,291 +24,294 @@ Capital preservation
 > delivery speed
 ```
 
-Minimum necessary implementation. No speculative features or generic OMS.
-Economic knobs may be ENV-driven but never weaken safety invariants.
+Minimum necessary implementation only. No speculative features, generic frameworks, multi-contract support, persistent DB, or unrelated cleanup.
 
-## 2. Desk execution accounting
+## 2. Authoritative desk accounting
 
-Hedger owns authoritative desk-wide position.
+Hedger owns combined desk position.
 
 Subscribe exactly:
+
 ```text
 ex.md.<FEED>.<TAKER_SENDER>
 ex.md.<FEED>.<SENDER>
 ex.md.<FEED>.<HEDGER_SENDER>
 ```
 
-No production wildcard subscription.
+No production wildcard accounting subscription.
+
+```text
+deskPosition = takerPosition + quoterPosition + hedgerPosition
+```
+
+Only `T/E` executions are position authority. Never infer position from request qty, `A.volume`, `Y <n>`, or seat status reports.
 
 ```text
 T = tracked sender is aggressor
 E = tracked sender is resting owner
+
 T side = aggressorSide
 E side = opposite(aggressorSide)
+
 Buy = +qty
 Sell = -qty
 ```
 
-Both E/T carry executions. Never infer position from request qty, `A.volume`, or `Y <n>`.
+Public order ID is `<sender>:<orderId>`.
 
-Dedup with:
 ```text
-(trackedSender,eventType,eventTimestamp,matchId,
- incomingOrderId,restingOrderId,qty,price,aggressorSide)
+T -> incoming sender == tracked sender
+E -> resting sender  == tracked sender
 ```
-Never by `matchId` alone.
 
-## 3. Hedger / desk.risk
+Ownership mismatch means accounting uncertainty.
+
+## 3. Dedup
+
+Use:
+
+```text
+(trackedSender, eventType, eventTimestamp, matchId,
+ incomingOrderId, restingOrderId, qty, price, aggressorSide)
+```
+
+Never dedup by `matchId` alone. A self-trade may create one valid event for each tracked desk sender; account each independently.
+
+Bounded dedup rule:
+
+```text
+exact duplicate -> ignore
+new key with capacity -> account + retain
+new key when capacity exhausted -> trust lost; do not count
+```
+
+Do not silently evict old keys.
+
+## 4. Accounting trust
+
+Accounting starts unready.
+
+After readiness, evidence that an execution may have been missed or misread causes:
+
+```text
+Accounting Trust = LOST
+preserve last-known positions for diagnostics
+desk state = UNKNOWN
+Quoter/Taker create no new exposure
+no automatic SAFE recovery
+```
+
+Examples: post-ready NATS disconnect, execution subscription trust loss, malformed/inconsistent `T/E`, sender mismatch, unknown sender-specific event, dedup exhaustion.
+
+Unknown position must never be represented as zero. Time alone never recovers UNKNOWN.
+
+Normal stream handling:
+
+```text
+valid A/C -> ignore for position
+valid T/E -> validate + account
+malformed/inconsistent T/E -> trust lost
+unknown/unrecognisable event -> trust lost
+```
+
+## 5. Desk risk protocol
 
 Publish `desk.risk.<FEED>`:
-```text
-<ts_ns> <seq> <feed> <net_position> <soft_limit> <hard_limit>
-<UNKNOWN|SAFE|CONTROLLED|EMERGENCY> <B|S|X>
-```
-
-Publish on state/position change + heartbeat <=250 ms.
-Stale >1000 ms by local monotonic receipt age.
-Seq is monotonic per trusted epoch and may reset after trust loss.
-Hedger uses `F`; executions are position authority.
-
-## 4. Runtime readiness
-
-States: `READY / WAITING / FATAL`.
-
-READY requires trusted connection/subscriptions + valid trusted BBO + fresh valid
-risk != UNKNOWN.
-
-Lifecycle stays separate.
-
-Quote gate:
-```text
-runtimeState.isReady() && orderManager.isReconciled()
-```
-
-## 5. BBO / reconnect trust
-
-BBO is latest state, not heartbeat. Keep valid BBO trusted while connection trust holds.
-Invalidate on newer invalid/empty state, trust loss, or incompatible metadata.
-
-Disconnect:
-- stop quoting
-- invalidate runtime trust
-- no Add/Cancel while disconnected
-- local order assumptions cannot resume exposure
-
-Reconnect/resubscription:
-- restore subscriptions
-- revalidate `EX_META`
-- recover retained/live BBO
-- require NEW valid risk
-- reconcile own Quoter orders
-- then allow new exposure
-
-Metadata unavailable -> WAITING.
-Malformed/incompatible metadata -> FATAL.
-
-## 6. Quoter order lifecycle
-
-Exactly two logical slots: `BID`, `ASK`; max one logical order each.
-
-States:
-```text
-EMPTY
-PENDING_ADD
-ACTIVE
-PENDING_CANCEL
-UNKNOWN
-```
-
-Terminal -> EMPTY.
-
-Occupied slot tracks:
-```text
-orderId
-requestedQty
-filledQty
-remainingQty = requestedQty - accumulated deduplicated E/T qty
-```
-
-### Request layer
 
 ```text
-beginAdd
-beginCancel
-markRequestUncertain
+<ts_ns> <seq> <feed> <net_position> <soft_limit> <hard_limit> <UNKNOWN|SAFE|CONTROLLED|EMERGENCY> <B|S|X>
 ```
-
-`Y` causes no lifecycle transition.
-Rejected/timeout/disconnected request outcome is uncertain:
-`PENDING_ADD/PENDING_CANCEL -> UNKNOWN`.
-
-Timeout is not proof of failure/success.
-Any unresolved UNKNOWN blocks new Quoter exposure.
-Sending reconciliation cancel while UNKNOWN does not resolve it.
-
-### Authoritative evidence
-
-```text
-A   -> onResting
-E/T -> onExecution
-C   -> onCancelled
-```
-
-Frozen rules:
-- E/T volume = actual matched qty.
-- one order may produce multiple executions.
-- `A.volume` is original submitted qty in supplied runtime; never remaining authority.
-- immediately fully-filled L may still emit A.
-- A/E/T/C may share one exchange timestamp.
-- timestamp is NOT lifecycle sequence.
-- correctness must not depend on callback order.
-
-Execution:
-```text
-newFilled < requested -> partial; preserve state
-newFilled == requested -> full; EMPTY
-newFilled > requested -> invariant violation
-```
-
-Normal larger contra order is not overfill:
-```text
-our remaining 1 + contra incoming 5
--> our execution qty 1
--> our order EMPTY
--> contra remainder 4 remains exchange-owned
-```
-
-Convergence:
-```text
-PENDING_ADD + A -> ACTIVE
-PENDING_ADD + partial E/T -> PENDING_ADD
-PENDING_ADD + full E/T -> EMPTY
-ACTIVE + partial E/T -> ACTIVE
-ACTIVE + full E/T -> EMPTY
-PENDING_CANCEL + partial E/T -> PENDING_CANCEL
-PENDING_CANCEL + full E/T -> EMPTY
-UNKNOWN + partial E/T -> UNKNOWN
-UNKNOWN + full E/T -> EMPTY
-same-current C -> EMPTY
-late old-order A/E/T/C -> lifecycle ignore; never reopen
-```
-
-Lifecycle ignore != execution ignore. Legitimate deduplicated E/T must still be accounted.
-
-### Replacement / uncertainty
-
-```text
-ACTIVE
--> send exact C
--> PENDING_CANCEL
--> authoritative terminal evidence
--> EMPTY
--> replacement
-```
-
-Never replace because cancel was merely sent or `Y` arrived.
 
 Defaults:
-```text
-ADD_REQUEST_TIMEOUT_MS=1000
-CANCEL_REQUEST_TIMEOUT_MS=1000
-```
-
-Emergency cancel dispatch target = 100 ms SLA, not request timeout.
-Use exact C normally. Use sender-scoped X only after selector semantics are proven.
-
-## 7. Order IDs
-
-8 chars, unique per sender.
-Do not use restart-resetting simple counters.
-Use compact session/process-unique prefix + local counter.
-
-## 8. Exchange essentials
 
 ```text
-Order entry: ex.req.<SENDER>
-Add: <SENDER> A <FEED> <id:8> <B|S> <volume> <price> <M|L|F>
-Cancel: <SENDER> C <FEED> <id:8>
-Cancel-many: <SENDER> X <FEED> <B|S|X> <price>
-Replies: Y <n> | N <code> <text>
+DESK_SOFT_POS = 6
+DESK_HARD_POS = 15
+0 < soft < hard
 ```
 
-Subject/payload sender must match.
-Quoter normally uses passive L; Hedger uses F.
+Mapping:
 
-## 9. Failure rules
-
-When uncertain: stop new exposure, preserve accounting, reconcile from authoritative
-evidence, resume only after trust is restored.
-
-Never treat timeout, disconnect, missing event, `A.volume`, or `Y <n>` as proof an order
-is gone or proof of remaining qty.
-
-Risk reduction outranks profit.
-
-## 10. Legacy Taker
-
-Modify only after controlled proof of material correctness/risk defect or minimum
-desk-wide safety change. No broad refactor.
-
-## 11. Current Micro Task — Quoter lifecycle MD integration
-
-Wire the Quoter's own sender-specific stream into `OrderManager`.
-
-Subscribe:
 ```text
-ex.md.<FEED>.<SENDER>
+abs(pos) < soft         -> SAFE
+soft <= abs(pos) < hard -> CONTROLLED
+abs(pos) >= hard        -> EMERGENCY
+
+SAFE / UNKNOWN -> X
+long risky desk -> S
+short risky desk -> B
 ```
 
-Handle only Quoter lifecycle evidence:
+Publish on position/state change plus heartbeat about every 200 ms.
+
+## 6. Hedger readiness
+
+Before first non-UNKNOWN `desk.risk`, Hedger requires:
+- trusted NATS connection
+- valid metadata for `TAKER_FEED`
+- exact Taker, Quoter, Hedger execution subscriptions installed
+- BBO subscription installed
+- subscription setup flushed/confirmed
+- accounting trust intact
+
+Only then may the fresh-session position be established as zero and first SAFE/non-UNKNOWN state be published.
+
+This zero start is valid only because Taker and Quoter cannot create exposure before Hedger readiness. A timeout alone never establishes readiness.
+
+Job 2.1 sends no hedge orders. Hedge execution readiness belongs to Job 2.2.
+
+## 7. Taker safety gate
+
+Legacy Taker change must stay minimal.
+
 ```text
-A / E / T / C
+fresh SAFE -> may send new Taker order
+
+UNKNOWN / CONTROLLED / EMERGENCY
+stale/no risk
+transport trust lost
+-> no new order
 ```
 
-Requirements:
-- read configured `SENDER`; subject identity must be exact
-- map public `<sender>:<orderId>` to the current 8-char order id
-- A side comes from A event B/S
-- for T, tracked order is incoming; side = aggressorSide
-- for E, tracked order is resting; side = opposite(aggressorSide)
-- E/T qty uses actual event volume
-- never use A.volume to update remaining
-- do not depend on A preceding E/T
-- old/stale lifecycle evidence must not reopen orders
-- malformed own-sender lifecycle input must fail closed
-- runtime readiness and lifecycle remain separate
-- keep file/class count minimal
+Freshness uses local monotonic receipt age `< 1000 ms`; sequence must not move backwards.
 
-Do NOT add here:
-- quote generation/economic tuning
-- Add/Cancel request sending
-- timeout scheduler
-- X recovery
-- STP
-- reconnect purge/reconciliation
-- Hedger changes
-- generic OMS
+Check the gate:
+1. before deciding to trade
+2. again immediately before `ex.req` dispatch
+
+No broad Taker refactor.
+
+## 8. Quoter / recovery
+
+Existing Job 1 Quoter behaviour is frozen unless concrete evidence shows a correctness defect.
+
+If desk risk is stale or UNKNOWN: no new exposure; cancel resting exposure as required.
+
+```text
+direction S -> suppress/cancel risk-increasing bids
+direction B -> suppress/cancel risk-increasing asks
+```
+
+Job 2.1 does not implement Hedger replay or automatic recovery:
+
+```text
+post-readiness trust loss -> UNKNOWN for remaining accounting epoch
+```
+
+Future memo: evaluate bounded JetStream exact-subject catch-up to establish a new trusted accounting epoch. Do not implement until separately approved.
+
+## 9. Job 2.1 boundary
+
+```text
+2.1A Accounting hardening
+2.1B Hedger runtime + risk publisher
+2.1C Minimal Taker SAFE gate
+2.1D Docker/startup integration
+```
+
+Deferred: hedge order execution/F sizing, controlled/emergency reduction logic, hedge TPS, oscillation tuning, JetStream accounting reconciliation, profitability tuning.
+
+# 10. Current Micro Task — Job 2.1A
+
+Goal: harden existing `hedger/accounting.py` into a production-safe accounting foundation.
+
+Reuse `DeskPositionAccounting`. Do not create a second accounting architecture.
+
+Required:
+1. distinguish valid `A/C` from `T/E`
+2. strict `T/E` parsing
+3. sender ownership validation
+4. signed side interpretation
+5. per-sender and desk net position
+6. full dedup key
+7. fail-closed accounting trust
+8. fail-closed dedup-capacity exhaustion
+9. focused tests
+
+Malformed/inconsistent execution evidence must not silently return zero.
+
+Trust-loss cases include malformed `T/E`, invalid qty/side/required fields, wrong sender ownership, unknown sender-specific event, and dedup exhaustion.
+
+Required response:
+
+```text
+mark accounting untrusted
+raise clear accounting-uncertainty exception
+do not apply uncertain execution
+```
+
+After trust loss, do not restore trust automatically and do not mutate authoritative position from later executions.
+
+Valid `A/C`:
+
+```text
+delta = 0
+position unchanged
+trust unchanged
+```
+
+Dedup:
+
+```text
+exact duplicate -> delta 0
+new event within capacity -> apply
+new event when capacity exhausted -> trust lost
+```
+
+Minimum tests:
+- incoming buyer/seller `T`
+- resting buyer/seller `E`
+- T/E ownership validation
+- three-sender aggregation
+- self-trade once per tracked sender
+- exact duplicate ignored
+- same matchId for legitimate distinct sender/event not collapsed
+- valid `A/C` ignored
+- malformed `T/E` -> trust lost
+- ownership mismatch -> trust lost
+- unknown/malformed event -> trust lost
+- dedup exhaustion -> trust lost
+- after trust loss, later execution does not mutate position
+
+Prefer changing only:
+
+```text
+hedger/accounting.py
+tests/test_desk_accounting_baseline.py
+```
+
+A tiny exception type may stay in `accounting.py`.
+
+Do NOT add NATS runtime/subscriptions, metadata/BBO handling, risk publisher/heartbeat, Dockerfile changes, Taker/Quoter changes, hedge orders, startup gate, JetStream replay, or generic frameworks.
 
 Validation:
+
 ```text
-focused integration tests
-all Java tests
-mvn package
+git status --short --branch
+focused Hedger accounting tests
+all existing Python tests
+python compile check where relevant
 git diff --check
+git diff --stat
 ```
 
-## 12. Deferred
+Inspect final diff. Do not commit, push, merge, create PR, or start Job 2.1B.
 
-Without evidence defer: multi-contract, directional prediction, persistent DB, generic
-OMS, complex crash recovery, exactly-once framework, multiple quote levels.
+Return:
+1. files changed
+2. purpose
+3. exact tests
+4. results
+5. git diff --stat
+6. unresolved concern, if any
 
-## 13. Agent rules
+## 11. Agent rules
 
-1. Work only on current Micro Task.
-2. DESIGN owns invariants; PROTOCOL owns wire details; NOTES owns evidence/history.
-3. Do not revive rejected assumptions or guess unresolved runtime behaviour.
-4. Stop on unexpected repo changes.
-5. Prefer existing architecture; keep file/class count minimal.
-6. Run focused tests, full relevant tests, and build validation.
-7. Record new controlled findings in NOTES.
-8. Do not start next Micro Task without reviewer approval.
+1. Work only on Current Micro Task.
+2. Read source-of-truth files before editing.
+3. Stop on unexpected unrelated changes.
+4. Prefer existing code and minimum necessary implementation.
+5. Risk/accounting uncertainty fails closed.
+6. Never turn unknown position into assumed zero.
+7. Run focused and broader relevant validation.
+8. Do not commit, push, merge, or start next Micro Task without approval.

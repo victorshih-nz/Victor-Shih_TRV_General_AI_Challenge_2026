@@ -140,3 +140,50 @@ The two bounded passes returned identical sequence and payload data.
     only after the entire reconciliation epoch has completed safely,
     pre-reconciliation orders are authoritatively resolved, routing is
     serialized, and before new exposure is enabled.
+
+## Job 2.1A — Authoritative Desk Position Accounting Hardening
+
+### Decisions
+
+- Hedger is authoritative for combined desk position.
+- Exact sender-specific execution subscriptions only; no wildcard + exact combination.
+- T means tracked sender owns incoming/aggressor order.
+- E means tracked sender owns resting order.
+- Buy positive / Sell negative.
+- Both public order IDs must be valid `<sender>:<orderId>`.
+- T incoming sender must equal tracked sender.
+- E resting sender must equal tracked sender.
+- Valid A/C are non-position events and are ignored.
+- Malformed/unknown/inconsistent authoritative evidence fails closed.
+- Dedup key includes trackedSender and eventType plus all execution identity fields.
+- Dedup capacity exhaustion loses accounting trust; do not silently evict.
+- Once accounting trust is lost, Job 2.1 does not automatically recover SAFE.
+- Unknown position must never be represented as zero.
+- Fresh SAFE only permits new Taker exposure.
+- Hedger readiness must precede Taker/Quoter trading.
+
+### Controlled Findings
+
+- Running Python tests from repo root caused `ModuleNotFoundError`; tests must run with candidate/ as import root or explicit project venv interpreter.
+- Copilot shell did not inherit the activated venv; explicit `.probe-venv/Scripts/python.exe` was required.
+- An E ownership test initially used the wrong wire-field interpretation; E ownership is based on the restingOrderId field.
+- Parser exceptions initially did not automatically mark accounting trust lost.
+- Initial self-trade fixtures did not represent the same physical match across sender-specific events.
+- Missing public sender prefixes could initially be inferred instead of rejected; changed to fail closed.
+- Invalid UTF-8 needed conversion to AccountingUncertainty.
+- Malformed A/C needed validation rather than unconditional ignore.
+
+### Test Evidence
+
+- Focused Job 2.1A accounting tests: 20 tests, PASS.
+- Full candidate Python suite: 28 tests, PASS.
+- `python -m compileall hedger tests`: PASS.
+- `git diff --check`: PASS.
+- Generated `__pycache__` directories removed before final status.
+- No Job 2.1B implementation started.
+
+### Deferred / Future Work
+
+- Full JetStream execution reconciliation/catch-up is intentionally deferred.
+- Job 2.1 trust loss remains UNKNOWN for the current accounting epoch.
+- Hedge order execution, F sizing, Controlled/Emergency reduction logic, and hedge TPS belong to Job 2.2.
