@@ -187,3 +187,75 @@ The two bounded passes returned identical sequence and payload data.
 - Full JetStream execution reconciliation/catch-up is intentionally deferred.
 - Job 2.1 trust loss remains UNKNOWN for the current accounting epoch.
 - Hedge order execution, F sizing, Controlled/Emergency reduction logic, and hedge TPS belong to Job 2.2.
+
+## Job 2.1B — Hedger Runtime + Desk Risk Publisher
+
+### Decisions
+
+- Hedger runtime reads `NATS_URL`, `TAKER_FEED`, `TAKER_SENDER`, `SENDER`,
+  `HEDGER_SENDER`, `DESK_SOFT_POS`, and `DESK_HARD_POS`.
+- `TAKER_FEED` is validated as 4 characters; all sender IDs as 8 characters;
+  Taker, Quoter, and Hedger senders must be distinct.
+- Desk limits default to soft `6` and hard `15`, with `0 < soft < hard`.
+- `EX_META` is loaded from JetStream KV bucket `EX_META` before readiness.
+- Metadata requires a positive `ticksize`; optional `ref_price` and non-negative
+  `band` are parsed and retained for later hedge execution work.
+- Production accounting subscribes only to the three exact sender-specific
+  market-data subjects plus the configured BBO subject.
+- BBO subscription presence is part of readiness; valid BBO data is not required
+  for Job 2.1B because hedge pricing/sizing belongs to Job 2.2.
+- Hedger flushes subscription setup before establishing the fresh-session
+  authoritative zero position and publishing the first non-UNKNOWN desk risk.
+- Risk payload is:
+  `<ts_ns> <seq> <feed> <net_position> <soft_limit> <hard_limit> <state> <direction>`.
+- Sequence increments on every publication, including heartbeat.
+- Heartbeat target is approximately 200 ms.
+- Accounting uncertainty publishes `UNKNOWN X` while preserving the last-known
+  net position.
+- A post-readiness NATS disconnect permanently loses accounting trust for the
+  current epoch. Reconnect may resume risk publication, but cannot recover SAFE.
+- Job 2.1B sends no orders and performs no hedge execution.
+
+### Controlled Findings
+
+- Existing protocol probe confirmed the Python NATS access pattern:
+  `nc.jetstream()`, `key_value("EX_META")`, exact `nc.subscribe(...)`, and
+  `nc.flush()`.
+- Quoter metadata implementation independently confirmed the expected `EX_META`
+  lookup by feed and required `ticksize` validation.
+- Hedger-only live validation required a clean environment with only
+  `nats`, `exchange`, and `sim`; old `strategy` and placeholder `hedger`
+  containers were stopped and removed to avoid ambiguous publishers.
+- Full desk testing was intentionally not run because the legacy Taker SAFE gate
+  is not implemented until Job 2.1C.
+
+### Test Evidence
+
+- Focused Job 2.1B runtime tests: 23 tests, PASS.
+- Full candidate Python suite: 51 tests, PASS.
+- `python -m compileall hedger tests`: PASS.
+- `git diff --check`: PASS.
+- Generated `__pycache__` directories removed before final status.
+- Hedger-only real NATS/Exchange/Sim smoke:
+  - first desk-risk sequence observed `1..8`
+  - net position `0`
+  - limits `6 / 15`
+  - state `SAFE`
+  - direction `X`
+  - observed heartbeat interval approximately 200 ms
+- Controlled NATS restart after readiness:
+  - post-reconnect sequence observed `239..243`
+  - sequence did not reset
+  - net position remained last-known `0`
+  - state remained `UNKNOWN`
+  - direction remained `X`
+  - no automatic SAFE recovery occurred
+
+### Deferred / Future Work
+
+- Job 2.1C implements the minimal legacy Taker fresh-SAFE gate.
+- Job 2.1D provides the real Hedger Dockerfile and full fresh-start integration.
+- Hedge F-order execution, BBO-based sizing, Controlled/Emergency reduction,
+  TPS limiting, and repeated emergency hedging belong to Job 2.2.
+- JetStream desk-accounting replay/reconciliation remains deferred; Job 2.1
+  trust loss stays UNKNOWN for the current accounting epoch.
