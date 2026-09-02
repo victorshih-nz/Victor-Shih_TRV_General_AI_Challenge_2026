@@ -432,7 +432,8 @@ final class OrderRequestClient implements AutoCloseable {
                     + candidateAddCount
                     + emergencyReserve;
 
-            if (required > metadata.getMaxTps()) {
+            if (metadata.getMaxTps() > 0
+                    && required > metadata.getMaxTps()) {
                 return null;
             }
 
@@ -520,7 +521,8 @@ final class OrderRequestClient implements AutoCloseable {
                     + outstandingCancelReservations
                     + 1L;
 
-            if (committed > metadata.getMaxTps()) {
+            if (metadata.getMaxTps() > 0
+                    && committed > metadata.getMaxTps()) {
                 return null;
             }
 
@@ -1003,6 +1005,10 @@ final class OrderRequestClient implements AutoCloseable {
     }
 
     private void assertTpsCommitmentWithinLimit() {
+        if (metadata.getMaxTps() <= 0) {
+            return;
+        }
+
         long committed =
             (long) requestTimesNanos.size()
                 + outstandingAddReservations

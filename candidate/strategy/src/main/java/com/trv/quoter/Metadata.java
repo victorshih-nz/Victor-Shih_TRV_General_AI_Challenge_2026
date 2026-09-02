@@ -106,7 +106,7 @@ public final class Metadata {
                 "positionLimit");
 
         this.maxTps =
-            requirePositiveInt(
+            requireNonNegativeInt(
                 maxTps,
                 "maxTps");
 
@@ -180,7 +180,7 @@ public final class Metadata {
             && minVolume > 0
             && maxVolume >= minVolume
             && positionLimit > 0
-            && maxTps > 0;
+            && maxTps >= 0;
     }
 
     /**
@@ -473,6 +473,19 @@ public final class Metadata {
             throw new IllegalArgumentException(
                 fieldName
                     + " must be > 0");
+        }
+
+        return value;
+    }
+
+    private static int requireNonNegativeInt(
+            int value,
+            String fieldName) {
+
+        if (value < 0) {
+            throw new IllegalArgumentException(
+                fieldName
+                    + " must be >= 0");
         }
 
         return value;

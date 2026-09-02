@@ -140,13 +140,24 @@ class QuoterFoundationTests {
                     + "min_volume=1 max_volume=10 "
                     + "position_limit=0 max_tps=40"));
 
+        Metadata zeroMaxTps =
+            Metadata.parse(
+                "AAH6",
+                "ticksize=1 ref_price=100 band=20 "
+                    + "min_volume=1 max_volume=10 "
+                    + "position_limit=12 max_tps=0");
+
+        assertEquals(
+            0,
+            zeroMaxTps.getMaxTps());
+
         assertThrows(
             IllegalArgumentException.class,
             () -> Metadata.parse(
                 "AAH6",
                 "ticksize=1 ref_price=100 band=20 "
                     + "min_volume=1 max_volume=10 "
-                    + "position_limit=12 max_tps=0"));
+                    + "position_limit=12 max_tps=-1"));
     }
 
     @Test
