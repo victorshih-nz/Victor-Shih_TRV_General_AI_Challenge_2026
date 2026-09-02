@@ -513,18 +513,66 @@ final class ReconciliationCoordinator implements AutoCloseable {
     private void tryCancel(
             OrderManager.Side side) {
 
-        if (orderManager.orderId(side) == null) {
-            return;
+        /*
+        * Recovery is authoritative-state conservative.
+        *
+        * PENDING_ADD means a local Add intent exists but its Exchange outcome is
+        * not yet safe to assume. Once desk recovery has already started, that
+        * unresolved sibling intent must be treated as uncertain before attempting
+        * an exact cancel. UNKNOWN preserves the uncertainty; it does not claim
+        * that the order definitely reached or rested on the Exchange.
+        *
+        * PENDING_CANCEL already has a cancel intent in flight, so do not issue a
+        * duplicate cancel. Live lifecycle / replay remains responsible for the
+        * authoritative terminal transition.
+        */
+        synchronized (orderManager) {
+            String orderId =
+                orderManager.orderId(side);
+
+            if (orderId == null) {
+                return;
+            }
+
+            OrderManager.State state =
+                orderManager.state(side);
+
+            if (state == OrderManager.State.EMPTY) {
+                return;
+            }
+
+            if (state == OrderManager.State.PENDING_CANCEL) {
+                return;
+            }
+
+            if (state == OrderManager.State.PENDING_ADD) {
+                orderManager.markRequestUncertainIfPending(
+                    side,
+                    orderId);
+
+                state =
+                    orderManager.state(side);
+            }
+
+            /*
+            * Only ACTIVE / UNKNOWN should reach the exact-cancel path.
+            * If a concurrent lifecycle transition produced another state, defer
+            * to the next cycle rather than inventing lifecycle evidence.
+            */
+            if (state != OrderManager.State.ACTIVE
+                    && state != OrderManager.State.UNKNOWN) {
+                return;
+            }
         }
 
         try {
             cancelAction.cancel(side);
         } catch (RuntimeException e) {
             /*
-             * A terminal live event may win the race between the current-id
-             * check and requestCancel(). If so, there is nothing left to cancel.
-             * Otherwise keep RECOVERING and let replay / later attempts resolve.
-             */
+            * A terminal live event may win the race between the state check and
+            * requestCancel(). If so, there is nothing left to cancel. Otherwise
+            * stay RECOVERING and let replay / later attempts resolve the slot.
+            */
             if (orderManager.state(side)
                     == OrderManager.State.EMPTY) {
                 return;

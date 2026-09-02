@@ -86,6 +86,149 @@ class ReconciliationCoordinatorTest {
     }
 
     @Test
+    void recoveryEscalatesSiblingPendingAddBeforeExactCancel() {
+        Fixture f = fixture();
+
+        f.replay.window =
+            new ReconciliationCoordinator.StreamWindow(
+                90,
+                100);
+
+        f.coordinator.initialize();
+
+        /*
+        * Reproduce the real SAFE-pair race:
+        *
+        * BID has already lost dispatch certainty and therefore triggered
+        * recovery, while the sibling ASK still sits in PENDING_ADD.
+        */
+        f.orders.beginAdd(
+            OrderManager.Side.BID,
+            "BID00001",
+            10,
+            100L);
+
+        f.orders.markRequestUncertain(
+            OrderManager.Side.BID,
+            "BID00001");
+
+        f.orders.beginAdd(
+            OrderManager.Side.ASK,
+            "ASK00001",
+            10,
+            101L);
+
+        assertEquals(
+            OrderManager.State.UNKNOWN,
+            f.orders.state(
+                OrderManager.Side.BID));
+
+        assertEquals(
+            OrderManager.State.PENDING_ADD,
+            f.orders.state(
+                OrderManager.Side.ASK));
+
+        f.coordinator.runOneCycleForTest();
+
+        /*
+        * Recovery must not try beginCancel() directly from PENDING_ADD.
+        * It first conservatively escalates that unresolved sibling to UNKNOWN,
+        * then exact-cancels both known ids.
+        */
+        assertEquals(
+            1,
+            f.cancel.bidCancels);
+
+        assertEquals(
+            1,
+            f.cancel.askCancels);
+
+        assertEquals(
+            OrderManager.State.UNKNOWN,
+            f.orders.state(
+                OrderManager.Side.BID));
+
+        assertEquals(
+            OrderManager.State.UNKNOWN,
+            f.orders.state(
+                OrderManager.Side.ASK));
+
+        assertEquals(
+            ReconciliationCoordinator.State.RECOVERING,
+            f.coordinator.state());
+
+        assertFalse(
+            f.sink.dedupCleared);
+    }
+
+    @Test
+    void recoveryDoesNotDuplicateExistingPendingCancel() {
+        Fixture f = fixture();
+
+        f.replay.window =
+            new ReconciliationCoordinator.StreamWindow(
+                90,
+                100);
+
+        f.coordinator.initialize();
+
+        /*
+        * BID triggers recovery.
+        */
+        f.orders.beginAdd(
+            OrderManager.Side.BID,
+            "BID00001",
+            10,
+            100L);
+
+        f.orders.markRequestUncertain(
+            OrderManager.Side.BID,
+            "BID00001");
+
+        /*
+        * ASK already has an authoritative resting state followed by a local
+        * cancel intent. Recovery must not issue another cancel request.
+        */
+        f.orders.beginAdd(
+            OrderManager.Side.ASK,
+            "ASK00001",
+            10,
+            101L);
+
+        f.orders.onResting(
+            OrderManager.Side.ASK,
+            "ASK00001");
+
+        f.orders.beginCancel(
+            OrderManager.Side.ASK,
+            "ASK00001");
+
+        assertEquals(
+            OrderManager.State.PENDING_CANCEL,
+            f.orders.state(
+                OrderManager.Side.ASK));
+
+        f.coordinator.runOneCycleForTest();
+
+        assertEquals(
+            1,
+            f.cancel.bidCancels);
+
+        assertEquals(
+            0,
+            f.cancel.askCancels);
+
+        assertEquals(
+            OrderManager.State.PENDING_CANCEL,
+            f.orders.state(
+                OrderManager.Side.ASK));
+
+        assertEquals(
+            ReconciliationCoordinator.State.RECOVERING,
+            f.coordinator.state());
+    }
+
+    @Test
     void replayCanResolveUnknownToEmptyAndCloseEpoch() {
         Fixture f = fixture();
 

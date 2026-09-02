@@ -12,7 +12,16 @@ from taker.taker import Taker
 
 
 class AlwaysOpenRiskGate:
-    """Test-only gate for legacy order/fill regression mechanics."""
+    """Test-only gate for legacy order/fill regression mechanics.
+
+    The production Taker now records the current desk-risk sequence when an
+    exposure order is dispatched. These legacy tests intentionally bypass the
+    real DeskRiskGate, so the test double must expose the same minimal read
+    contract used by Taker.take().
+    """
+
+    def __init__(self):
+        self.last_seq = 1
 
     def allows_new_exposure(self):
         return True

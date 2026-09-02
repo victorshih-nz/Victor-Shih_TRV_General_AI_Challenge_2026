@@ -383,6 +383,86 @@ class QuoterOrderRequestClientTest {
                 transport.calls);
         }
     }
+    @Test
+    void addReadinessLossBetweenRegistrationAndDispatchFailsClosed() {
+        OrderManager manager =
+            new OrderManager();
+
+        AtomicBoolean addReady =
+            new AtomicBoolean(true);
+
+        AtomicInteger transportChecks =
+            new AtomicInteger();
+
+        BooleanSupplier transportTrust = () -> {
+            transportChecks.incrementAndGet();
+
+            /*
+             * Deterministically flip desk/exposure readiness at the existing
+             * pre-network transport check. This places the state transition
+             * after beginAdd() but before transport.request().
+             */
+            addReady.set(false);
+            return true;
+        };
+
+        FakeTransport transport =
+            new FakeTransport(manager);
+
+        ScheduledExecutorService scheduler =
+            Executors.newSingleThreadScheduledExecutor();
+
+        OrderRequestClient client =
+            new OrderRequestClient(
+                SENDER,
+                FEED,
+                metadata(1),
+                manager,
+                addReady::get,
+                transportTrust,
+                transport,
+                scheduler,
+                Duration.ofHours(1),
+                Duration.ofHours(1));
+
+        try (client) {
+            client.requestAdd(
+                OrderManager.Side.BID,
+                "BID00001",
+                1,
+                500);
+
+            assertFalse(addReady.get());
+            assertEquals(
+                OrderManager.State.UNKNOWN,
+                manager.state(OrderManager.Side.BID));
+            assertEquals(0, transport.calls);
+            assertEquals(1, transportChecks.get());
+        }
+    }
+
+    @Test
+    void cancelStillDispatchesWhenAddEnvironmentIsNotReady() {
+        try (Fixture f = new Fixture()) {
+            makeActiveAsk(
+                f.manager,
+                "ASK00001",
+                10);
+
+            f.addReady.set(false);
+
+            f.client.requestCancel(
+                OrderManager.Side.ASK);
+
+            assertEquals(
+                OrderManager.State.PENDING_CANCEL,
+                f.manager.state(OrderManager.Side.ASK));
+            assertEquals(1, f.transport.calls);
+            assertEquals(
+                "QUOTE001 C AAH6 ASK00001",
+                f.transport.payload());
+        }
+    }
 
     @Test
     void addValidatesTickAlignmentAndPriceBandBeforeRegisteringOrder() {

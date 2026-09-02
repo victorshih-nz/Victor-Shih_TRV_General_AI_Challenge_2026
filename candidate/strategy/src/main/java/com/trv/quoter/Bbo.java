@@ -11,7 +11,13 @@ public final class Bbo {
     private final BigDecimal askQty;
     private final Instant receivedAt;
 
-    public Bbo(BigDecimal bidPrice, BigDecimal bidQty, BigDecimal askPrice, BigDecimal askQty, Instant receivedAt) {
+    public Bbo(
+            BigDecimal bidPrice,
+            BigDecimal bidQty,
+            BigDecimal askPrice,
+            BigDecimal askQty,
+            Instant receivedAt) {
+
         this.bidPrice = bidPrice;
         this.bidQty = bidQty;
         this.askPrice = askPrice;
@@ -43,81 +49,240 @@ public final class Bbo {
         return receivedAt.toEpochMilli();
     }
 
-    public boolean isValid(Metadata metadata) {
+    /**
+     * Protocol validity is intentionally broader than quote readiness.
+     *
+     * The Exchange represents an empty side as "- 0". That is a legitimate
+     * market state, not malformed input. A present price must still carry a
+     * strictly positive quantity.
+     */
+    public boolean isProtocolStateValid(Metadata metadata) {
         if (metadata == null || !metadata.isValid()) {
             return false;
         }
+
         if (receivedAt == null) {
             return false;
         }
-        if (bidPrice == null || askPrice == null || bidQty == null || askQty == null) {
+
+        if (!isProtocolSideValid(
+                bidPrice,
+                bidQty,
+                metadata)) {
+
             return false;
         }
-        if (bidQty.compareTo(BigDecimal.ZERO) <= 0 || askQty.compareTo(BigDecimal.ZERO) <= 0) {
+
+        if (!isProtocolSideValid(
+                askPrice,
+                askQty,
+                metadata)) {
+
             return false;
         }
-        if (bidPrice.compareTo(askPrice) >= 0) {
-            return false;
-        }
-        if (!metadata.isPriceWithinBounds(bidPrice) || !metadata.isPriceWithinBounds(askPrice)) {
-            return false;
-        }
-        return true;
+
+        return bidPrice == null
+            || askPrice == null
+            || bidPrice.compareTo(askPrice) < 0;
+    }
+
+    /**
+     * Quote readiness remains strict: Quoter fair-value logic requires both
+     * sides. One-sided / empty books parse successfully but are not quote-ready.
+     */
+    public boolean isValid(Metadata metadata) {
+        return isProtocolStateValid(metadata)
+            && bidPrice != null
+            && askPrice != null;
     }
 
     public BigDecimal midpoint() {
-        return bidPrice.add(askPrice).divide(BigDecimal.valueOf(2), 10, RoundingMode.HALF_UP);
+        if (bidPrice == null || askPrice == null) {
+            throw new IllegalStateException(
+                "midpoint requires a two-sided BBO");
+        }
+
+        return bidPrice
+            .add(askPrice)
+            .divide(
+                BigDecimal.valueOf(2),
+                10,
+                RoundingMode.HALF_UP);
     }
 
-    public static Bbo parse(String line, Metadata metadata) {
+    public static Bbo parse(
+            String line,
+            Metadata metadata) {
+
         if (line == null || line.isBlank()) {
-            throw new IllegalArgumentException("BBO line is blank");
+            throw new IllegalArgumentException(
+                "BBO line is blank");
         }
-        String[] parts = line.trim().split("\\s+");
+
+        String[] parts =
+            line.trim().split("\\s+");
+
         if (parts.length != 6) {
-            throw new IllegalArgumentException("Malformed BBO: expected 6 fields");
+            throw new IllegalArgumentException(
+                "Malformed BBO: expected 6 fields");
         }
-        long exchangeTimestamp;
+
         try {
-            exchangeTimestamp = Long.parseLong(parts[0]);
+            Long.parseLong(parts[0]);
         } catch (NumberFormatException e) {
-            throw new IllegalArgumentException("Malformed BBO timestamp: " + parts[0], e);
+            throw new IllegalArgumentException(
+                "Malformed BBO timestamp: "
+                    + parts[0],
+                e);
         }
+
         String feed = parts[1];
-        if (metadata != null && !metadata.getFeed().equals(feed)) {
-            throw new IllegalArgumentException("BBO feed does not match metadata feed");
+
+        if (metadata != null
+                && !metadata.getFeed().equals(feed)) {
+
+            throw new IllegalArgumentException(
+                "BBO feed does not match metadata feed");
         }
-        BigDecimal bidPrice = parsePrice(parts[2]);
-        BigDecimal bidQty = parseQty(parts[3]);
-        BigDecimal askPrice = parsePrice(parts[4]);
-        BigDecimal askQty = parseQty(parts[5]);
-        return new Bbo(bidPrice, bidQty, askPrice, askQty, Instant.now());
+
+        ParsedSide bid =
+            parseSide(
+                parts[2],
+                parts[3],
+                "bid");
+
+        ParsedSide ask =
+            parseSide(
+                parts[4],
+                parts[5],
+                "ask");
+
+        Bbo bbo =
+            new Bbo(
+                bid.price(),
+                bid.quantity(),
+                ask.price(),
+                ask.quantity(),
+                Instant.now());
+
+        if (metadata != null
+                && !bbo.isProtocolStateValid(metadata)) {
+
+            throw new IllegalArgumentException(
+                "BBO market state is invalid");
+        }
+
+        return bbo;
     }
 
-    private static BigDecimal parsePrice(String text) {
-        if (text == null || text.equals("-")) {
-            throw new IllegalArgumentException("Price is missing");
-        }
-        try {
-            long price = Long.parseLong(text);
-            return BigDecimal.valueOf(price);
-        } catch (NumberFormatException e) {
-            throw new IllegalArgumentException("Price must be an integer, saw " + text, e);
-        }
-    }
+    private static ParsedSide parseSide(
+            String priceText,
+            String qtyText,
+            String sideName) {
 
-    private static BigDecimal parseQty(String text) {
-        if (text == null || text.equals("-")) {
-            throw new IllegalArgumentException("Quantity is missing");
-        }
-        try {
-            long qty = Long.parseLong(text);
-            if (qty <= 0) {
-                throw new IllegalArgumentException("Quantity must be positive, saw " + text);
+        if ("-".equals(priceText)) {
+            long qty =
+                parseNonNegativeInteger(
+                    qtyText,
+                    sideName + " quantity");
+
+            if (qty != 0L) {
+                throw new IllegalArgumentException(
+                    sideName
+                        + " empty price must have zero quantity");
             }
-            return BigDecimal.valueOf(qty);
-        } catch (NumberFormatException e) {
-            throw new IllegalArgumentException("Quantity must be an integer, saw " + text, e);
+
+            return new ParsedSide(
+                null,
+                BigDecimal.ZERO);
         }
+
+        long price =
+            parsePositiveInteger(
+                priceText,
+                sideName + " price");
+
+        long qty =
+            parsePositiveInteger(
+                qtyText,
+                sideName + " quantity");
+
+        return new ParsedSide(
+            BigDecimal.valueOf(price),
+            BigDecimal.valueOf(qty));
+    }
+
+    private static long parsePositiveInteger(
+            String text,
+            String fieldName) {
+
+        long value =
+            parseNonNegativeInteger(
+                text,
+                fieldName);
+
+        if (value <= 0L) {
+            throw new IllegalArgumentException(
+                fieldName
+                    + " must be positive, saw "
+                    + text);
+        }
+
+        return value;
+    }
+
+    private static long parseNonNegativeInteger(
+            String text,
+            String fieldName) {
+
+        if (text == null || "-".equals(text)) {
+            throw new IllegalArgumentException(
+                fieldName + " is missing");
+        }
+
+        final long value;
+
+        try {
+            value = Long.parseLong(text);
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException(
+                fieldName
+                    + " must be an integer, saw "
+                    + text,
+                e);
+        }
+
+        if (value < 0L) {
+            throw new IllegalArgumentException(
+                fieldName
+                    + " must be non-negative, saw "
+                    + text);
+        }
+
+        return value;
+    }
+
+    private static boolean isProtocolSideValid(
+            BigDecimal price,
+            BigDecimal quantity,
+            Metadata metadata) {
+
+        if (quantity == null) {
+            return false;
+        }
+
+        if (price == null) {
+            return quantity.compareTo(
+                BigDecimal.ZERO) == 0;
+        }
+
+        return quantity.compareTo(
+                BigDecimal.ZERO) > 0
+            && metadata.isPriceWithinBounds(price);
+    }
+
+    private record ParsedSide(
+        BigDecimal price,
+        BigDecimal quantity) {
     }
 }

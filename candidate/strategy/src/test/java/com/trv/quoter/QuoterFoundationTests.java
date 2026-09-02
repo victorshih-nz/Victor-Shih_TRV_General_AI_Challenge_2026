@@ -20,7 +20,9 @@ class QuoterFoundationTests {
     );
 
     private static Metadata validMetadata() {
-        return Metadata.parse("AAH6", "ticksize=1 ref_price=1000 band=50");
+        return Metadata.parse(
+            "AAH6",
+            "ticksize=1 ref_price=1000 band=50");
     }
 
     @Test
@@ -29,7 +31,9 @@ class QuoterFoundationTests {
                 "TAKER_FEED", "AAH6",
                 "MARKET_DATA_STALE_MS", "3000"
         ));
-        Metadata metadata = Metadata.parse("AAH6", "ticksize=1 ref_price=1000 band=50");
+        Metadata metadata = Metadata.parse(
+            "AAH6",
+            "ticksize=1 ref_price=1000 band=50");
 
         assertEquals("AAH6", config.getFeed());
         assertTrue(metadata.isValid());
@@ -37,178 +41,601 @@ class QuoterFoundationTests {
 
     @Test
     void invalidMissingRequiredConfigFailsClosed() {
-        assertThrows(IllegalArgumentException.class, () -> QuoterConfig.fromMap(Map.of("MARKET_DATA_STALE_MS", "3000")));
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> QuoterConfig.fromMap(
+                Map.of(
+                    "MARKET_DATA_STALE_MS",
+                    "3000")));
     }
 
     @Test
     void invalidNanEwmaAlphaFailsClosed() {
-        assertThrows(IllegalArgumentException.class, () -> QuoterConfig.fromMap(Map.of(
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> QuoterConfig.fromMap(Map.of(
                 "TAKER_FEED", "AAH6",
                 "EWMA_ALPHA", "NaN"
-        )));
+            )));
     }
 
     @Test
     void bboWithNullReceivedAtIsInvalid() {
         Metadata metadata = validMetadata();
-        Bbo bbo = new Bbo(new BigDecimal("1000"), new BigDecimal("9"), new BigDecimal("1001"), new BigDecimal("10"), null);
+        Bbo bbo = new Bbo(
+            new BigDecimal("1000"),
+            new BigDecimal("9"),
+            new BigDecimal("1001"),
+            new BigDecimal("10"),
+            null);
 
+        assertFalse(bbo.isProtocolStateValid(metadata));
         assertFalse(bbo.isValid(metadata));
-        assertFalse(MarketReadiness.isReady(DEFAULT_CONFIG, metadata, bbo, HedgerState.SAFE, Instant.now()));
+        assertFalse(
+            MarketReadiness.isReady(
+                DEFAULT_CONFIG,
+                metadata,
+                bbo,
+                HedgerState.SAFE,
+                Instant.now()));
     }
 
     @Test
     void validTwoSidedBbo() {
         Metadata metadata = validMetadata();
-        Bbo bbo = new Bbo(new BigDecimal("1000"), new BigDecimal("9"), new BigDecimal("1001"), new BigDecimal("10"), Instant.now());
+        Bbo bbo = new Bbo(
+            new BigDecimal("1000"),
+            new BigDecimal("9"),
+            new BigDecimal("1001"),
+            new BigDecimal("10"),
+            Instant.now());
 
+        assertTrue(bbo.isProtocolStateValid(metadata));
         assertTrue(bbo.isValid(metadata));
     }
 
     @Test
     void validProtocolBboLineParses() {
         Metadata metadata = validMetadata();
-        Bbo bbo = Bbo.parse("1700000000000 AAH6 1000 9 1001 10", metadata);
+
+        Bbo bbo =
+            Bbo.parse(
+                "1700000000000 AAH6 1000 9 1001 10",
+                metadata);
 
         assertNotNull(bbo);
+        assertTrue(bbo.isProtocolStateValid(metadata));
         assertTrue(bbo.isValid(metadata));
+    }
+
+    @Test
+    void oneSidedBidBboIsLegitimateButNotQuoteReady() {
+        Metadata metadata = validMetadata();
+
+        Bbo bbo =
+            Bbo.parse(
+                "1700000000000 AAH6 1000 9 - 0",
+                metadata);
+
+        assertTrue(bbo.isProtocolStateValid(metadata));
+        assertFalse(bbo.isValid(metadata));
+
+        assertEquals(
+            new BigDecimal("1000"),
+            bbo.getBidPrice());
+        assertEquals(
+            new BigDecimal("9"),
+            bbo.getBidQty());
+        assertNull(bbo.getAskPrice());
+        assertEquals(
+            BigDecimal.ZERO,
+            bbo.getAskQty());
+
+        assertFalse(
+            MarketReadiness.isReady(
+                DEFAULT_CONFIG,
+                metadata,
+                bbo,
+                HedgerState.SAFE,
+                Instant.now()));
+    }
+
+    @Test
+    void oneSidedAskBboIsLegitimateButNotQuoteReady() {
+        Metadata metadata = validMetadata();
+
+        Bbo bbo =
+            Bbo.parse(
+                "1700000000000 AAH6 - 0 1001 10",
+                metadata);
+
+        assertTrue(bbo.isProtocolStateValid(metadata));
+        assertFalse(bbo.isValid(metadata));
+
+        assertNull(bbo.getBidPrice());
+        assertEquals(
+            BigDecimal.ZERO,
+            bbo.getBidQty());
+        assertEquals(
+            new BigDecimal("1001"),
+            bbo.getAskPrice());
+        assertEquals(
+            new BigDecimal("10"),
+            bbo.getAskQty());
+
+        assertFalse(
+            MarketReadiness.isReady(
+                DEFAULT_CONFIG,
+                metadata,
+                bbo,
+                HedgerState.SAFE,
+                Instant.now()));
+    }
+
+    @Test
+    void fullyEmptyBboIsLegitimateButNotQuoteReady() {
+        Metadata metadata = validMetadata();
+
+        Bbo bbo =
+            Bbo.parse(
+                "1700000000000 AAH6 - 0 - 0",
+                metadata);
+
+        assertTrue(bbo.isProtocolStateValid(metadata));
+        assertFalse(bbo.isValid(metadata));
+
+        assertNull(bbo.getBidPrice());
+        assertNull(bbo.getAskPrice());
+        assertEquals(
+            BigDecimal.ZERO,
+            bbo.getBidQty());
+        assertEquals(
+            BigDecimal.ZERO,
+            bbo.getAskQty());
+
+        assertFalse(
+            MarketReadiness.isReady(
+                DEFAULT_CONFIG,
+                metadata,
+                bbo,
+                HedgerState.SAFE,
+                Instant.now()));
+    }
+
+    @Test
+    void oneSidedBboCannotProduceMidpoint() {
+        Metadata metadata = validMetadata();
+
+        Bbo bbo =
+            Bbo.parse(
+                "1700000000000 AAH6 1000 9 - 0",
+                metadata);
+
+        assertThrows(
+            IllegalStateException.class,
+            bbo::midpoint);
     }
 
     @Test
     void malformedProtocolBboRejected() {
         Metadata metadata = validMetadata();
 
-        assertThrows(IllegalArgumentException.class, () -> Bbo.parse("abc AAH6 1000 9 1001 10", metadata));
-        assertThrows(IllegalArgumentException.class, () -> Bbo.parse("1700000000000 AAH6 1000.5 9 1001 10", metadata));
-        assertThrows(IllegalArgumentException.class, () -> Bbo.parse("1700000000000 AAH6 1000 9.5 1001 10", metadata));
-        assertThrows(IllegalArgumentException.class, () -> Bbo.parse("1700000000000 AAH6 - 9 1001 10", metadata));
-        assertThrows(IllegalArgumentException.class, () -> Bbo.parse("1700000000000 AAH6 1000 9 1001 -", metadata));
-        assertThrows(IllegalArgumentException.class, () -> Bbo.parse("1700000000000 OTHER 1000 9 1001 10", metadata));
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> Bbo.parse(
+                "abc AAH6 1000 9 1001 10",
+                metadata));
+
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> Bbo.parse(
+                "1700000000000 AAH6 1000.5 9 1001 10",
+                metadata));
+
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> Bbo.parse(
+                "1700000000000 AAH6 1000 9.5 1001 10",
+                metadata));
+
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> Bbo.parse(
+                "1700000000000 AAH6 - 9 1001 10",
+                metadata));
+
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> Bbo.parse(
+                "1700000000000 AAH6 1000 9 1001 -",
+                metadata));
+
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> Bbo.parse(
+                "1700000000000 OTHER 1000 9 1001 10",
+                metadata));
+    }
+
+    @Test
+    void malformedEmptySideCombinationsRejected() {
+        Metadata metadata = validMetadata();
+
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> Bbo.parse(
+                "1700000000000 AAH6 - 1 1001 10",
+                metadata));
+
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> Bbo.parse(
+                "1700000000000 AAH6 1000 9 - 1",
+                metadata));
+
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> Bbo.parse(
+                "1700000000000 AAH6 1000 0 1001 10",
+                metadata));
+
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> Bbo.parse(
+                "1700000000000 AAH6 1000 9 1001 0",
+                metadata));
     }
 
     @Test
     void crossedOrInvalidBboRejected() {
         Metadata metadata = validMetadata();
 
-        assertFalse(new Bbo(new BigDecimal("1001"), new BigDecimal("7"), new BigDecimal("1000"), new BigDecimal("10"), Instant.now()).isValid(metadata));
-        assertFalse(new Bbo(new BigDecimal("1000"), new BigDecimal("0"), new BigDecimal("1001"), new BigDecimal("10"), Instant.now()).isValid(metadata));
-        assertFalse(new Bbo(new BigDecimal("1000"), new BigDecimal("9"), null, new BigDecimal("10"), Instant.now()).isValid(metadata));
+        assertFalse(
+            new Bbo(
+                new BigDecimal("1001"),
+                new BigDecimal("7"),
+                new BigDecimal("1000"),
+                new BigDecimal("10"),
+                Instant.now())
+                .isProtocolStateValid(metadata));
+
+        assertFalse(
+            new Bbo(
+                new BigDecimal("1000"),
+                new BigDecimal("0"),
+                new BigDecimal("1001"),
+                new BigDecimal("10"),
+                Instant.now())
+                .isProtocolStateValid(metadata));
+
+        assertFalse(
+            new Bbo(
+                new BigDecimal("1000"),
+                new BigDecimal("9"),
+                null,
+                new BigDecimal("10"),
+                Instant.now())
+                .isProtocolStateValid(metadata));
     }
 
     @Test
     void feedMismatchNotReady() {
-        Metadata metadata = Metadata.parse("AAH6", "ticksize=1 ref_price=1000 band=50");
-        Bbo fresh = new Bbo(new BigDecimal("1000"), new BigDecimal("9"), new BigDecimal("1001"), new BigDecimal("10"), Instant.now());
+        Metadata metadata = Metadata.parse(
+            "AAH6",
+            "ticksize=1 ref_price=1000 band=50");
 
-        QuoterConfig mismatched = new QuoterConfig("OTHER", 3000, 5, 4, 2, 1, 20, 0.25);
-        assertFalse(MarketReadiness.isReady(mismatched, metadata, fresh, HedgerState.SAFE, Instant.now()));
+        Bbo fresh = new Bbo(
+            new BigDecimal("1000"),
+            new BigDecimal("9"),
+            new BigDecimal("1001"),
+            new BigDecimal("10"),
+            Instant.now());
+
+        QuoterConfig mismatched =
+            new QuoterConfig(
+                "OTHER",
+                3000,
+                5,
+                4,
+                2,
+                1,
+                20,
+                0.25);
+
+        assertFalse(
+            MarketReadiness.isReady(
+                mismatched,
+                metadata,
+                fresh,
+                HedgerState.SAFE,
+                Instant.now()));
     }
 
     @Test
     void validMetadataFreshBboAndNonUnknownHedgerIsReady() {
         Metadata metadata = validMetadata();
-        Bbo fresh = new Bbo(new BigDecimal("1000"), new BigDecimal("9"), new BigDecimal("1001"), new BigDecimal("10"), Instant.now());
 
-        assertTrue(MarketReadiness.isReady(DEFAULT_CONFIG, metadata, fresh, HedgerState.SAFE, Instant.now()));
+        Bbo fresh = new Bbo(
+            new BigDecimal("1000"),
+            new BigDecimal("9"),
+            new BigDecimal("1001"),
+            new BigDecimal("10"),
+            Instant.now());
+
+        assertTrue(
+            MarketReadiness.isReady(
+                DEFAULT_CONFIG,
+                metadata,
+                fresh,
+                HedgerState.SAFE,
+                Instant.now()));
     }
 
     @Test
     void unknownHedgerNotReady() {
         Metadata metadata = validMetadata();
-        Bbo fresh = new Bbo(new BigDecimal("1000"), new BigDecimal("9"), new BigDecimal("1001"), new BigDecimal("10"), Instant.now());
 
-        assertFalse(MarketReadiness.isReady(DEFAULT_CONFIG, metadata, fresh, HedgerState.UNKNOWN, Instant.now()));
+        Bbo fresh = new Bbo(
+            new BigDecimal("1000"),
+            new BigDecimal("9"),
+            new BigDecimal("1001"),
+            new BigDecimal("10"),
+            Instant.now());
+
+        assertFalse(
+            MarketReadiness.isReady(
+                DEFAULT_CONFIG,
+                metadata,
+                fresh,
+                HedgerState.UNKNOWN,
+                Instant.now()));
     }
 
     @Test
     void midpointCalculation() {
-        Bbo bbo = new Bbo(new BigDecimal("1000"), new BigDecimal("7"), new BigDecimal("1002"), new BigDecimal("8"), Instant.now());
-        FairValueCalculator calculator = new FairValueCalculator();
+        Bbo bbo = new Bbo(
+            new BigDecimal("1000"),
+            new BigDecimal("7"),
+            new BigDecimal("1002"),
+            new BigDecimal("8"),
+            Instant.now());
 
-        BigDecimal midpoint = calculator.calculateMidpoint(bbo);
-        assertEquals(0, midpoint.compareTo(new BigDecimal("1001.0")));
+        BigDecimal midpoint =
+            bbo.midpoint();
+
+        assertEquals(
+            0,
+            midpoint.compareTo(
+                new BigDecimal("1001.0")));
     }
 
     @Test
     void symmetricBookProducesZeroMicropriceAdjustment() {
         Metadata metadata = validMetadata();
-        Bbo symmetric = new Bbo(new BigDecimal("1000"), new BigDecimal("10"), new BigDecimal("1001"), new BigDecimal("10"), Instant.now());
-        FairValueCalculator calculator = new FairValueCalculator();
 
-        BigDecimal adjustment = calculator.calculateMicropriceAdjustment(symmetric, metadata, DEFAULT_CONFIG);
-        assertEquals(0, adjustment.compareTo(BigDecimal.ZERO));
+        Bbo symmetric = new Bbo(
+            new BigDecimal("1000"),
+            new BigDecimal("10"),
+            new BigDecimal("1001"),
+            new BigDecimal("10"),
+            Instant.now());
+
+        FairValueCalculator calculator =
+            new FairValueCalculator();
+
+        BigDecimal adjustment =
+            calculator.calculateMicropriceAdjustment(
+                symmetric,
+                metadata,
+                DEFAULT_CONFIG);
+
+        assertEquals(
+            0,
+            adjustment.compareTo(BigDecimal.ZERO));
     }
 
     @Test
     void bidHeavyBookShiftsFairValueUpward() {
         Metadata metadata = validMetadata();
-        Bbo bidHeavy = new Bbo(new BigDecimal("1000"), new BigDecimal("40"), new BigDecimal("1001"), new BigDecimal("10"), Instant.now());
-        FairValueCalculator calculator = new FairValueCalculator();
 
-        BigDecimal fairValue = calculator.calculateFairValue(bidHeavy, metadata, DEFAULT_CONFIG);
-        assertTrue(fairValue.compareTo(bidHeavy.midpoint()) > 0);
-        assertTrue(fairValue.compareTo(bidHeavy.getAskPrice()) < 0);
+        Bbo bidHeavy = new Bbo(
+            new BigDecimal("1000"),
+            new BigDecimal("40"),
+            new BigDecimal("1001"),
+            new BigDecimal("10"),
+            Instant.now());
+
+        FairValueCalculator calculator =
+            new FairValueCalculator();
+
+        BigDecimal fairValue =
+            calculator.calculateFairValue(
+                bidHeavy,
+                metadata,
+                DEFAULT_CONFIG);
+
+        assertTrue(
+            fairValue.compareTo(
+                bidHeavy.midpoint()) > 0);
+
+        assertTrue(
+            fairValue.compareTo(
+                bidHeavy.getAskPrice()) < 0);
     }
 
     @Test
     void askHeavyBookShiftsFairValueDownward() {
         Metadata metadata = validMetadata();
-        Bbo askHeavy = new Bbo(new BigDecimal("1000"), new BigDecimal("10"), new BigDecimal("1001"), new BigDecimal("40"), Instant.now());
-        FairValueCalculator calculator = new FairValueCalculator();
 
-        BigDecimal fairValue = calculator.calculateFairValue(askHeavy, metadata, DEFAULT_CONFIG);
-        assertTrue(fairValue.compareTo(askHeavy.midpoint()) < 0);
-        assertTrue(fairValue.compareTo(askHeavy.getBidPrice()) > 0);
+        Bbo askHeavy = new Bbo(
+            new BigDecimal("1000"),
+            new BigDecimal("10"),
+            new BigDecimal("1001"),
+            new BigDecimal("40"),
+            Instant.now());
+
+        FairValueCalculator calculator =
+            new FairValueCalculator();
+
+        BigDecimal fairValue =
+            calculator.calculateFairValue(
+                askHeavy,
+                metadata,
+                DEFAULT_CONFIG);
+
+        assertTrue(
+            fairValue.compareTo(
+                askHeavy.midpoint()) < 0);
+
+        assertTrue(
+            fairValue.compareTo(
+                askHeavy.getBidPrice()) > 0);
     }
 
     @Test
     void adjustmentRespectsBound() {
         Metadata metadata = validMetadata();
-        Bbo extreme = new Bbo(new BigDecimal("990"), new BigDecimal("1000"), new BigDecimal("1010"), new BigDecimal("1"), Instant.now());
-        FairValueCalculator calculator = new FairValueCalculator();
 
-        BigDecimal adjustment = calculator.calculateMicropriceAdjustment(extreme, metadata, DEFAULT_CONFIG);
-        assertEquals(0, adjustment.compareTo(BigDecimal.valueOf(4)));
-        BigDecimal fairValue = calculator.calculateFairValue(extreme, metadata, DEFAULT_CONFIG);
-        assertTrue(fairValue.compareTo(extreme.getBidPrice()) > 0);
-        assertTrue(fairValue.compareTo(extreme.getAskPrice()) < 0);
+        Bbo extreme = new Bbo(
+            new BigDecimal("990"),
+            new BigDecimal("1000"),
+            new BigDecimal("1010"),
+            new BigDecimal("1"),
+            Instant.now());
+
+        FairValueCalculator calculator =
+            new FairValueCalculator();
+
+        BigDecimal adjustment =
+            calculator.calculateMicropriceAdjustment(
+                extreme,
+                metadata,
+                DEFAULT_CONFIG);
+
+        assertEquals(
+            0,
+            adjustment.compareTo(
+                BigDecimal.valueOf(4)));
+
+        BigDecimal fairValue =
+            calculator.calculateFairValue(
+                extreme,
+                metadata,
+                DEFAULT_CONFIG);
+
+        assertTrue(
+            fairValue.compareTo(
+                extreme.getBidPrice()) > 0);
+
+        assertTrue(
+            fairValue.compareTo(
+                extreme.getAskPrice()) < 0);
     }
 
     @Test
     void ewmaMovementInTickUnits() {
         Metadata metadata = validMetadata();
-        EwmaMovement ewma = new EwmaMovement();
 
-        BigDecimal first = ewma.update(new BigDecimal("1000"), metadata.getTickSize(), 0.5);
-        BigDecimal second = ewma.update(new BigDecimal("1001"), metadata.getTickSize(), 0.5);
+        EwmaMovement ewma =
+            new EwmaMovement();
 
-        assertEquals(new BigDecimal("0.5"), second.setScale(1, java.math.RoundingMode.HALF_UP));
-        assertTrue(first.compareTo(BigDecimal.ZERO) >= 0);
+        BigDecimal first =
+            ewma.update(
+                new BigDecimal("1000"),
+                metadata.getTickSize(),
+                0.5);
+
+        BigDecimal second =
+            ewma.update(
+                new BigDecimal("1001"),
+                metadata.getTickSize(),
+                0.5);
+
+        assertEquals(
+            new BigDecimal("0.5"),
+            second.setScale(
+                1,
+                java.math.RoundingMode.HALF_UP));
+
+        assertTrue(
+            first.compareTo(BigDecimal.ZERO) >= 0);
     }
 
     @Test
     void adaptiveBandLowerAndUpperBound() {
         Metadata metadata = validMetadata();
-        Bbo bbo = new Bbo(new BigDecimal("1000"), new BigDecimal("9"), new BigDecimal("1001"), new BigDecimal("10"), Instant.now());
-        AdaptiveValueBand adaptiveValueBand = new AdaptiveValueBand();
 
-        BigDecimal lowerBound = adaptiveValueBand.calculateValueBandTicks(bbo, metadata, DEFAULT_CONFIG, BigDecimal.ZERO);
-        assertTrue(lowerBound.compareTo(BigDecimal.valueOf(1)) >= 0);
+        Bbo bbo = new Bbo(
+            new BigDecimal("1000"),
+            new BigDecimal("9"),
+            new BigDecimal("1001"),
+            new BigDecimal("10"),
+            Instant.now());
 
-        BigDecimal upperBound = adaptiveValueBand.calculateValueBandTicks(bbo, metadata, DEFAULT_CONFIG, BigDecimal.valueOf(100.0));
-        assertTrue(upperBound.compareTo(BigDecimal.valueOf(20)) <= 0);
+        AdaptiveValueBand adaptiveValueBand =
+            new AdaptiveValueBand();
+
+        BigDecimal lowerBound =
+            adaptiveValueBand
+                .calculateValueBandTicks(
+                    bbo,
+                    metadata,
+                    DEFAULT_CONFIG,
+                    BigDecimal.ZERO);
+
+        BigDecimal upperBound =
+            adaptiveValueBand
+                .calculateValueBandTicks(
+                    bbo,
+                    metadata,
+                    DEFAULT_CONFIG,
+                    BigDecimal.valueOf(100.0));
+
+        assertTrue(
+            lowerBound.compareTo(
+                BigDecimal.valueOf(1)) >= 0);
+
+        assertTrue(
+            upperBound.compareTo(
+                BigDecimal.valueOf(20)) <= 0);
     }
 
     @Test
     void cheapFairExpensiveOrdering() {
         Metadata metadata = validMetadata();
-        Bbo bbo = new Bbo(new BigDecimal("1000"), new BigDecimal("9"), new BigDecimal("1001"), new BigDecimal("10"), Instant.now());
-        AdaptiveValueBand adaptiveValueBand = new AdaptiveValueBand();
 
-        BigDecimal fair = new FairValueCalculator().calculateFairValue(bbo, metadata, DEFAULT_CONFIG);
-        BigDecimal band = adaptiveValueBand.calculateValueBandTicks(bbo, metadata, DEFAULT_CONFIG, BigDecimal.ZERO).multiply(metadata.getTickSize());
-        BigDecimal cheap = fair.subtract(band);
-        BigDecimal expensive = fair.add(band);
+        Bbo bbo = new Bbo(
+            new BigDecimal("1000"),
+            new BigDecimal("9"),
+            new BigDecimal("1001"),
+            new BigDecimal("10"),
+            Instant.now());
+
+        AdaptiveValueBand adaptiveValueBand =
+            new AdaptiveValueBand();
+
+        BigDecimal fair =
+            new FairValueCalculator()
+                .calculateFairValue(
+                    bbo,
+                    metadata,
+                    DEFAULT_CONFIG);
+
+        BigDecimal band =
+            adaptiveValueBand
+                .calculateValueBandTicks(
+                    bbo,
+                    metadata,
+                    DEFAULT_CONFIG,
+                    BigDecimal.ZERO)
+                .multiply(
+                    metadata.getTickSize());
+
+        BigDecimal cheap =
+            fair.subtract(band);
+
+        BigDecimal expensive =
+            fair.add(band);
 
         assertTrue(cheap.compareTo(fair) < 0);
         assertTrue(fair.compareTo(expensive) < 0);
@@ -216,17 +643,29 @@ class QuoterFoundationTests {
 
     @Test
     void cheapSignalProducesPositiveValuationAdjustment() {
-        assertTrue(ValuationSignal.CHEAP.valuationAdjustmentTicks(DEFAULT_CONFIG).compareTo(BigDecimal.ZERO) > 0);
+        assertTrue(
+            ValuationSignal.CHEAP
+                .valuationAdjustmentTicks(
+                    DEFAULT_CONFIG)
+                .compareTo(BigDecimal.ZERO) > 0);
     }
 
     @Test
     void fairSignalProducesZeroValuationAdjustment() {
-        assertEquals(BigDecimal.ZERO, ValuationSignal.FAIR.valuationAdjustmentTicks(DEFAULT_CONFIG));
+        assertEquals(
+            BigDecimal.ZERO,
+            ValuationSignal.FAIR
+                .valuationAdjustmentTicks(
+                    DEFAULT_CONFIG));
     }
 
     @Test
     void expensiveSignalProducesNegativeValuationAdjustment() {
-        assertTrue(ValuationSignal.EXPENSIVE.valuationAdjustmentTicks(DEFAULT_CONFIG).compareTo(BigDecimal.ZERO) < 0);
+        assertTrue(
+            ValuationSignal.EXPENSIVE
+                .valuationAdjustmentTicks(
+                    DEFAULT_CONFIG)
+                .compareTo(BigDecimal.ZERO) < 0);
     }
 
     @Test
@@ -234,11 +673,11 @@ class QuoterFoundationTests {
         Metadata metadata = validMetadata();
 
         Bbo old = new Bbo(
-                new BigDecimal("1000"),
-                new BigDecimal("9"),
-                new BigDecimal("1001"),
-                new BigDecimal("10"),
-                Instant.now().minusSeconds(60));
+            new BigDecimal("1000"),
+            new BigDecimal("9"),
+            new BigDecimal("1001"),
+            new BigDecimal("10"),
+            Instant.now().minusSeconds(60));
 
         assertTrue(
             MarketReadiness.isReady(
@@ -254,11 +693,11 @@ class QuoterFoundationTests {
         Metadata metadata = validMetadata();
 
         Bbo future = new Bbo(
-                new BigDecimal("1000"),
-                new BigDecimal("9"),
-                new BigDecimal("1001"),
-                new BigDecimal("10"),
-                Instant.now().plusSeconds(60));
+            new BigDecimal("1000"),
+            new BigDecimal("9"),
+            new BigDecimal("1001"),
+            new BigDecimal("10"),
+            Instant.now().plusSeconds(60));
 
         assertTrue(
             MarketReadiness.isReady(

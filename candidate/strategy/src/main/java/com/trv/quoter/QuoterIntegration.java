@@ -355,7 +355,12 @@ public final class QuoterIntegration implements ConnectionListener {
             Bbo bbo =
                 Bbo.parse(payload, metadata);
 
-            if (!bbo.isValid(metadata)) {
+            /*
+             * "- 0" is a legitimate empty Exchange side.
+             * Protocol-valid one-sided / empty books are not quote-ready,
+             * but must not be classified as malformed.
+             */
+            if (!bbo.isProtocolStateValid(metadata)) {
                 synchronized (bboRecoveryLock) {
                     liveBboSeen = true;
                     runtimeState.invalidateBbo();
@@ -364,6 +369,20 @@ public final class QuoterIntegration implements ConnectionListener {
                 logger.warning(
                     "Invalid BBO state: " + payload);
 
+                signalQuoteEvaluation();
+                return;
+            }
+
+            if (!bbo.isValid(metadata)) {
+                synchronized (bboRecoveryLock) {
+                    liveBboSeen = true;
+                    runtimeState.invalidateBbo();
+                }
+
+                /*
+                 * Legitimate one-sided / empty market.
+                 * Fail closed for quoting without malformed-input noise.
+                 */
                 signalQuoteEvaluation();
                 return;
             }

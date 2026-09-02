@@ -5,6 +5,12 @@ The legacy momentum and order logic is unchanged. New exposure is permitted only
 while a fresh Hedger desk-risk message says SAFE and the NATS transport is
 trusted.
 
+Job 2.2D adds a causal exposure barrier: after a filled Taker order, no new
+exposure may be dispatched until the Taker has observed its own authoritative T
+execution, Hedger has explicitly acknowledged accounting the same execution
+match(es), and the associated desk-risk publication has been processed. This
+prevents rapid reuse of a stale SAFE snapshot.
+
 Config (env):
   NATS_URL        default nats://127.0.0.1:4222
   TAKER_FEED      contract to trade            (default BTH6)
@@ -206,9 +212,24 @@ class Taker:
         self.best_ask = None
         self.mids = collections.deque(maxlen=LAG + 1)
         self.position = 0
-        self.cash = 0.0  # signed: buys spend cash, sells receive cash
+        self.cash = 0.0
         self.fills = 0
         self.send_lock = asyncio.Lock()
+
+        # At most one exposure-creating Taker order may be causally unresolved.
+        #
+        # The barrier is installed before dispatch. For a positive Y reply it
+        # remains until all three independent pieces of evidence agree:
+        #   1) own authoritative T volume reaches the exchange-confirmed fill;
+        #   2) Hedger ACKs the same order/match volume after accounting it;
+        #   3) Taker has processed desk.risk at least through the ACK risk seq.
+        #
+        # Risk publication sequence is freshness evidence only. It is never
+        # treated as an execution/accounting acknowledgement by itself.
+        #
+        # A request timeout keeps the barrier closed because the exchange
+        # outcome is unknown.
+        self.pending_exposure = None
 
     def next_oid(self):
         self.oid += 1
@@ -219,8 +240,145 @@ class Taker:
             return None
         return (self.best_bid + self.best_ask) / 2
 
+    def _try_release_pending_exposure(self):
+        pending = self.pending_exposure
+        if pending is None or pending["uncertain"]:
+            return
+
+        expected_fill = pending["expected_fill"]
+        if expected_fill is None or expected_fill <= 0:
+            return
+
+        if pending["confirmed_fill"] != expected_fill:
+            return
+
+        if pending["accounted_fill"] != expected_fill:
+            return
+
+        required_risk_seq = pending["accounted_risk_seq"]
+        if required_risk_seq is None:
+            return
+
+        current_risk_seq = self.risk_gate.last_seq
+        if (
+            current_risk_seq is None
+            or current_risk_seq < required_risk_seq
+        ):
+            return
+
+        # Causal reconciliation is complete. DeskRiskGate remains the final
+        # exposure gate: if the reconciled state is CONTROLLED/EMERGENCY/
+        # UNKNOWN, new exposure stays blocked even though this order-specific
+        # barrier can now be cleared.
+        self.pending_exposure = None
+
     async def on_risk(self, msg):
-        self.risk_gate.accept(msg.data)
+        accepted = self.risk_gate.accept(msg.data)
+        if accepted:
+            self._try_release_pending_exposure()
+
+    async def on_execution(self, msg):
+        """Observe authoritative own T executions for causal pacing only."""
+
+        pending = self.pending_exposure
+        if pending is None:
+            return
+
+        try:
+            fields = msg.data.decode("ascii").split()
+            if len(fields) != 8 or fields[1] != "T":
+                return
+
+            incoming_public_id = fields[2]
+            expected_public_id = f"{SENDER}:{pending['order_id']}"
+            if incoming_public_id != expected_public_id:
+                return
+
+            quantity = int(fields[4])
+            match_id = fields[6]
+            side = fields[7]
+
+            if quantity <= 0 or not match_id:
+                pending["uncertain"] = True
+                return
+            if side != pending["side"]:
+                pending["uncertain"] = True
+                return
+
+        except (UnicodeDecodeError, ValueError, TypeError):
+            pending["uncertain"] = True
+            return
+
+        if match_id in pending["own_match_ids"]:
+            return
+
+        pending["own_match_ids"].add(match_id)
+        pending["confirmed_fill"] += quantity
+
+        expected_fill = pending["expected_fill"]
+        if (
+            expected_fill is not None
+            and pending["confirmed_fill"] > expected_fill
+        ):
+            pending["uncertain"] = True
+            return
+
+        self._try_release_pending_exposure()
+
+    async def on_accounted(self, msg):
+        """Consume Hedger's explicit Taker accounting acknowledgement."""
+
+        pending = self.pending_exposure
+        if pending is None:
+            return
+
+        try:
+            fields = msg.data.decode("ascii").split()
+            if len(fields) != 4:
+                raise ValueError("accounting ACK must contain 4 fields")
+
+            order_id, match_id, qty_text, risk_seq_text = fields
+            if order_id != pending["order_id"]:
+                return
+
+            quantity = int(qty_text)
+            risk_seq = int(risk_seq_text)
+
+            if quantity <= 0 or risk_seq < 0 or not match_id:
+                raise ValueError("invalid accounting ACK values")
+
+        except (UnicodeDecodeError, ValueError, TypeError):
+            pending["uncertain"] = True
+            return
+
+        previous = pending["accounted_matches"].get(match_id)
+        if previous is not None:
+            if previous != (quantity, risk_seq):
+                pending["uncertain"] = True
+            return
+
+        pending["accounted_matches"][match_id] = (
+            quantity,
+            risk_seq,
+        )
+        pending["accounted_fill"] += quantity
+
+        previous_required_seq = pending["accounted_risk_seq"]
+        if (
+            previous_required_seq is None
+            or risk_seq > previous_required_seq
+        ):
+            pending["accounted_risk_seq"] = risk_seq
+
+        expected_fill = pending["expected_fill"]
+        if (
+            expected_fill is not None
+            and pending["accounted_fill"] > expected_fill
+        ):
+            pending["uncertain"] = True
+            return
+
+        self._try_release_pending_exposure()
 
     async def on_bbo(self, msg):
         # payload:
@@ -249,9 +407,10 @@ class Taker:
         await self.maybe_trade()
 
     async def maybe_trade(self):
-        # First gate check: do not even decide to create exposure unless the
-        # latest authoritative desk risk is fresh SAFE.
         if not self.risk_gate.allows_new_exposure():
+            return
+
+        if self.pending_exposure is not None:
             return
 
         if len(self.mids) < self.mids.maxlen:
@@ -274,9 +433,13 @@ class Taker:
 
     async def take(self, side):
         async with self.send_lock:
-            # Second gate check immediately before request dispatch. This closes
-            # the normal TOCTOU window between signal evaluation and order send.
+            # Second gate check immediately before request dispatch.
             if not self.risk_gate.allows_new_exposure():
+                return
+
+            # A prior exposure order must be fully reconciled through own T and
+            # a newer Hedger risk publication before another order is allowed.
+            if self.pending_exposure is not None:
                 return
 
             px = (
@@ -293,6 +456,20 @@ class Taker:
                 f"{side} {CLIP} {px} F"
             )
 
+            pending = {
+                "order_id": oid,
+                "side": side,
+                "pre_risk_seq": self.risk_gate.last_seq,
+                "expected_fill": None,
+                "confirmed_fill": 0,
+                "own_match_ids": set(),
+                "accounted_fill": 0,
+                "accounted_matches": {},
+                "accounted_risk_seq": None,
+                "uncertain": False,
+            }
+            self.pending_exposure = pending
+
             try:
                 reply = await self.nc.request(
                     f"ex.req.{SENDER}",
@@ -300,14 +477,57 @@ class Taker:
                     timeout=1.0,
                 )
             except Exception:
-                return  # timed out; treat as no fill
+                # Outcome unknown: intentionally keep pending_exposure set.
+                pending["uncertain"] = True
+                return
 
-            parts = reply.data.decode().split()
-            if len(parts) >= 3 and parts[1] == "Y":
+            try:
+                parts = reply.data.decode().split()
+                if len(parts) < 3:
+                    raise ValueError("order reply is incomplete")
+
+                status = parts[1]
+
+                if status == "N":
+                    if pending["confirmed_fill"] == 0:
+                        self.pending_exposure = None
+                    else:
+                        pending["uncertain"] = True
+                    return
+
+                if status != "Y":
+                    raise ValueError("unknown order reply status")
+
                 filled = int(parts[2])
-                self.apply_fill(side, filled, px)
-                if filled > 0:
-                    self.fills += 1
+                if filled < 0:
+                    raise ValueError("negative fill quantity")
+
+            except (UnicodeDecodeError, ValueError, TypeError):
+                pending["uncertain"] = True
+                return
+
+            pending["expected_fill"] = filled
+
+            if (
+                pending["confirmed_fill"] > filled
+                or pending["accounted_fill"] > filled
+            ):
+                pending["uncertain"] = True
+                return
+
+            # Preserve legacy local PnL/status accounting. Authoritative desk
+            # position and the causal release barrier remain T/ACK/risk-driven.
+            self.apply_fill(side, filled, px)
+            if filled > 0:
+                self.fills += 1
+
+            if filled == 0:
+                # F had no immediate execution, so no exposure was created.
+                # A contradictory late T would be a protocol/runtime fault.
+                self.pending_exposure = None
+                return
+
+            self._try_release_pending_exposure()
 
     def apply_fill(self, side, qty, px):
         signed = qty if side == "B" else -qty
@@ -363,12 +583,19 @@ async def main():
         risk_gate=risk_gate,
     )
 
-    # Install risk before market data and keep transport trust closed until both
-    # subscriptions have been flushed. BBO callbacks that arrive earlier cannot
-    # create exposure because the gate remains fail-closed.
+    # Install risk, exact own execution, and Hedger accounting ACK before
+    # market data. Keep transport trust closed until all subscriptions flush.
     await nc.subscribe(
         f"desk.risk.{FEED}",
         cb=t.on_risk,
+    )
+    await nc.subscribe(
+        f"ex.md.{FEED}.{SENDER}",
+        cb=t.on_execution,
+    )
+    await nc.subscribe(
+        f"desk.accounted.{FEED}.{SENDER}",
+        cb=t.on_accounted,
     )
     await nc.subscribe(
         f"ex.bbo.{FEED}",

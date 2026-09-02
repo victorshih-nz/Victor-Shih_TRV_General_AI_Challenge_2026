@@ -278,7 +278,8 @@ final class OrderRequestClient implements AutoCloseable {
             side,
             orderId,
             payload,
-            addUncertaintyTimeout);
+            addUncertaintyTimeout,
+            true);
     }
 
     void requestCancel(
@@ -328,7 +329,8 @@ final class OrderRequestClient implements AutoCloseable {
             side,
             orderId,
             payload,
-            cancelUncertaintyTimeout);
+            cancelUncertaintyTimeout,
+            false);
     }
 
     /*
@@ -353,7 +355,8 @@ final class OrderRequestClient implements AutoCloseable {
             OrderManager.Side side,
             String orderId,
             String payload,
-            Duration uncertaintyTimeout) {
+            Duration uncertaintyTimeout,
+            boolean requiresAddEnvironmentReady) {
 
         try {
             deadlineScheduler.schedule(
@@ -381,6 +384,24 @@ final class OrderRequestClient implements AutoCloseable {
                 side,
                 orderId,
                 "transport lost before request dispatch",
+                null);
+            return;
+        }
+        /*
+         * Re-check exposure readiness at the actual network-dispatch boundary.
+         * A quote decision may have been valid when requestAdd() started but
+         * become unsafe after local PENDING_ADD registration and before the
+         * request leaves the process.
+         *
+         * Cancel is risk-reducing and deliberately bypasses this gate.
+         */
+        if (requiresAddEnvironmentReady
+                && !addEnvironmentReady.getAsBoolean()) {
+
+            markPendingUncertain(
+                side,
+                orderId,
+                "environment lost readiness before add dispatch",
                 null);
             return;
         }
