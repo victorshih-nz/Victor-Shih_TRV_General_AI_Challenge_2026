@@ -366,11 +366,17 @@ final class OrderRequestClient implements AutoCloseable {
                 uncertaintyTimeout.toNanos(),
                 TimeUnit.NANOSECONDS);
         } catch (RuntimeException e) {
-            markPendingUncertain(
-                side,
-                orderId,
-                "failed to schedule request deadline",
-                e);
+            if (requiresAddEnvironmentReady) {
+                orderManager.abortPendingAddIfCurrent(
+                    side,
+                    orderId);
+            } else {
+                markPendingUncertain(
+                    side,
+                    orderId,
+                    "failed to schedule request deadline",
+                    e);
+            }
             throw e;
         }
 
@@ -378,15 +384,28 @@ final class OrderRequestClient implements AutoCloseable {
          * Re-check immediately before network dispatch. The production NATS
          * connection also disables reconnect buffering, so a request is not
          * intentionally queued to appear after trust loss.
+         *
+         * For Add, a failed check here is a definite local abort: the request
+         * has not crossed transport.request(), so the Exchange cannot have seen
+         * this Add. Restore the exact still-pending Add to EMPTY instead of
+         * inventing lifecycle uncertainty. Cancel keeps the conservative
+         * UNKNOWN behavior because the resting order may already exist remotely.
          */
         if (!transportTrusted.getAsBoolean()) {
-            markPendingUncertain(
-                side,
-                orderId,
-                "transport lost before request dispatch",
-                null);
+            if (requiresAddEnvironmentReady) {
+                orderManager.abortPendingAddIfCurrent(
+                    side,
+                    orderId);
+            } else {
+                markPendingUncertain(
+                    side,
+                    orderId,
+                    "transport lost before request dispatch",
+                    null);
+            }
             return;
         }
+
         /*
          * Re-check exposure readiness at the actual network-dispatch boundary.
          * A quote decision may have been valid when requestAdd() started but
@@ -398,11 +417,9 @@ final class OrderRequestClient implements AutoCloseable {
         if (requiresAddEnvironmentReady
                 && !addEnvironmentReady.getAsBoolean()) {
 
-            markPendingUncertain(
+            orderManager.abortPendingAddIfCurrent(
                 side,
-                orderId,
-                "environment lost readiness before add dispatch",
-                null);
+                orderId);
             return;
         }
 

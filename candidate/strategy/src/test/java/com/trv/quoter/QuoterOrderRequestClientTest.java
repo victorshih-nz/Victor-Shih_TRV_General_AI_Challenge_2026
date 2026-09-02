@@ -383,8 +383,9 @@ class QuoterOrderRequestClientTest {
                 transport.calls);
         }
     }
+
     @Test
-    void addReadinessLossBetweenRegistrationAndDispatchFailsClosed() {
+    void addReadinessLossBetweenRegistrationAndDispatchAbortsUndispatchedAdd() {
         OrderManager manager =
             new OrderManager();
 
@@ -434,8 +435,71 @@ class QuoterOrderRequestClientTest {
 
             assertFalse(addReady.get());
             assertEquals(
-                OrderManager.State.UNKNOWN,
+                OrderManager.State.EMPTY,
                 manager.state(OrderManager.Side.BID));
+            assertEquals(0, transport.calls);
+            assertEquals(1, transportChecks.get());
+
+            /*
+             * The already-scheduled request deadline must not resurrect an
+             * Add that was definitely aborted before network dispatch.
+             */
+            client.onRequestDeadline(
+                OrderManager.Side.BID,
+                "BID00001");
+
+            assertEquals(
+                OrderManager.State.EMPTY,
+                manager.state(OrderManager.Side.BID));
+        }
+    }
+
+    @Test
+    void transportLossBeforeAddDispatchAbortsUndispatchedAdd() {
+        OrderManager manager =
+            new OrderManager();
+
+        AtomicBoolean addReady =
+            new AtomicBoolean(true);
+
+        AtomicInteger transportChecks =
+            new AtomicInteger();
+
+        BooleanSupplier transportTrust = () -> {
+            transportChecks.incrementAndGet();
+            return false;
+        };
+
+        FakeTransport transport =
+            new FakeTransport(manager);
+
+        ScheduledExecutorService scheduler =
+            Executors.newSingleThreadScheduledExecutor();
+
+        OrderRequestClient client =
+            new OrderRequestClient(
+                SENDER,
+                FEED,
+                metadata(1),
+                manager,
+                addReady::get,
+                transportTrust,
+                transport,
+                scheduler,
+                Duration.ofHours(1),
+                Duration.ofHours(1));
+
+        try (client) {
+            client.requestAdd(
+                OrderManager.Side.BID,
+                "BID00001",
+                1,
+                500);
+
+            assertEquals(
+                OrderManager.State.EMPTY,
+                manager.state(OrderManager.Side.BID));
+
             assertEquals(0, transport.calls);
             assertEquals(1, transportChecks.get());
         }

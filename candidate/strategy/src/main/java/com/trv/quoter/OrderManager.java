@@ -145,6 +145,37 @@ public class OrderManager {
     }
 
     /*
+     * Abort a locally registered Add only when the caller knows the request
+     * has definitely not crossed the network-dispatch boundary.
+     *
+     * This is not reconciliation and not request uncertainty. If the exact
+     * current slot is still PENDING_ADD, no Exchange lifecycle evidence can
+     * exist for this request, so restoring EMPTY is authoritative from the
+     * local dispatch boundary.
+     *
+     * Returns true only when this exact pending Add was cleared.
+     */
+    public synchronized boolean abortPendingAddIfCurrent(
+            Side side,
+            String orderId) {
+
+        validateInputs(side, orderId);
+
+        Slot slot = slot(side);
+
+        if (!isCurrentOrder(slot, orderId)) {
+            return false;
+        }
+
+        if (slot.state != State.PENDING_ADD) {
+            return false;
+        }
+
+        clear(slot);
+        return true;
+    }
+
+    /*
      * Request-layer race-safe transition.
      *
      * A late N/exception/deadline must never override authoritative lifecycle
