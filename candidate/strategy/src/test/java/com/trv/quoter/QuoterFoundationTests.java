@@ -22,9 +22,176 @@ class QuoterFoundationTests {
     private static Metadata validMetadata() {
         return Metadata.parse(
             "AAH6",
-            "ticksize=1 ref_price=1000 band=50");
+            "ticksize=1 ref_price=1000 band=50 min_volume=1 max_volume=100 position_limit=200 max_tps=100");
     }
 
+    @Test
+    void completeExchangeMetadataParsesIntoTypedContract() {
+        Metadata metadata =
+            Metadata.parse(
+                "AAH6",
+                "ticksize=0.01 ref_price=100.25 band=20.50 "
+                    + "min_volume=2 max_volume=25 "
+                    + "position_limit=12 max_tps=40 "
+                    + "last_traded_price=101");
+
+        assertEquals(
+            new BigDecimal("0.01"),
+            metadata.getTickSize());
+
+        assertEquals(
+            new BigDecimal("100.25"),
+            metadata.getRefPrice());
+
+        assertEquals(
+            new BigDecimal("20.50"),
+            metadata.getBand());
+
+        assertEquals(2, metadata.getMinVolume());
+        assertEquals(25, metadata.getMaxVolume());
+        assertEquals(12, metadata.getPositionLimit());
+        assertEquals(40, metadata.getMaxTps());
+
+        assertEquals(
+            "101",
+            metadata.getRawValues()
+                .get("last_traded_price"));
+
+        assertTrue(metadata.isValid());
+    }
+
+    @Test
+    void missingTradingCriticalMetadataFailsClosed() {
+        String complete =
+            "ticksize=1 ref_price=100 band=20 "
+                + "min_volume=1 max_volume=10 "
+                + "position_limit=12 max_tps=40";
+
+        for (String key :
+                new String[] {
+                    "ticksize",
+                    "ref_price",
+                    "band",
+                    "min_volume",
+                    "max_volume",
+                    "position_limit",
+                    "max_tps"
+                }) {
+
+            String withoutKey =
+                java.util.Arrays.stream(
+                    complete.split("\\s+"))
+                    .filter(
+                        part ->
+                            !part.startsWith(
+                                key + "="))
+                    .collect(
+                        java.util.stream.Collectors.joining(" "));
+
+            assertThrows(
+                IllegalArgumentException.class,
+                () -> Metadata.parse(
+                    "AAH6",
+                    withoutKey),
+                "missing " + key
+                    + " must fail closed");
+        }
+    }
+
+    @Test
+    void invalidExchangeLimitRelationshipsFailClosed() {
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> Metadata.parse(
+                "AAH6",
+                "ticksize=1 ref_price=100 band=20 "
+                    + "min_volume=11 max_volume=10 "
+                    + "position_limit=12 max_tps=40"));
+
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> Metadata.parse(
+                "AAH6",
+                "ticksize=0 ref_price=100 band=20 "
+                    + "min_volume=1 max_volume=10 "
+                    + "position_limit=12 max_tps=40"));
+
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> Metadata.parse(
+                "AAH6",
+                "ticksize=1 ref_price=100 band=-1 "
+                    + "min_volume=1 max_volume=10 "
+                    + "position_limit=12 max_tps=40"));
+
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> Metadata.parse(
+                "AAH6",
+                "ticksize=1 ref_price=100 band=20 "
+                    + "min_volume=0 max_volume=10 "
+                    + "position_limit=12 max_tps=40"));
+
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> Metadata.parse(
+                "AAH6",
+                "ticksize=1 ref_price=100 band=20 "
+                    + "min_volume=1 max_volume=10 "
+                    + "position_limit=0 max_tps=40"));
+
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> Metadata.parse(
+                "AAH6",
+                "ticksize=1 ref_price=100 band=20 "
+                    + "min_volume=1 max_volume=10 "
+                    + "position_limit=12 max_tps=0"));
+    }
+
+    @Test
+    void integerExchangeLimitsRejectNonIntegerText() {
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> Metadata.parse(
+                "AAH6",
+                "ticksize=1 ref_price=100 band=20 "
+                    + "min_volume=1.5 max_volume=10 "
+                    + "position_limit=12 max_tps=40"));
+
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> Metadata.parse(
+                "AAH6",
+                "ticksize=1 ref_price=100 band=20 "
+                    + "min_volume=1 max_volume=10 "
+                    + "position_limit=12 max_tps=40.5"));
+    }
+
+    @Test
+    void metadataUsesExactBigDecimalTickArithmetic() {
+        Metadata metadata =
+            Metadata.parse(
+                "AAH6",
+                "ticksize=0.01 ref_price=1 band=2 "
+                    + "min_volume=1 max_volume=10 "
+                    + "position_limit=12 max_tps=40");
+
+        assertTrue(
+            metadata.isPriceOnTick(
+                new BigDecimal("1.23")));
+
+        assertFalse(
+            metadata.isPriceOnTick(
+                new BigDecimal("1.234")));
+
+        /*
+         * Protocol does not state that ref_price - band must be positive.
+         */
+        assertTrue(
+            metadata.isPriceWithinBounds(
+                new BigDecimal("-0.50")));
+    }
     @Test
     void validConfigMetadataAccepted() {
         QuoterConfig config = QuoterConfig.fromMap(Map.of(
@@ -33,7 +200,7 @@ class QuoterFoundationTests {
         ));
         Metadata metadata = Metadata.parse(
             "AAH6",
-            "ticksize=1 ref_price=1000 band=50");
+            "ticksize=1 ref_price=1000 band=50 min_volume=1 max_volume=100 position_limit=200 max_tps=100");
 
         assertEquals("AAH6", config.getFeed());
         assertTrue(metadata.isValid());
@@ -322,7 +489,7 @@ class QuoterFoundationTests {
     void feedMismatchNotReady() {
         Metadata metadata = Metadata.parse(
             "AAH6",
-            "ticksize=1 ref_price=1000 band=50");
+            "ticksize=1 ref_price=1000 band=50 min_volume=1 max_volume=100 position_limit=200 max_tps=100");
 
         Bbo fresh = new Bbo(
             new BigDecimal("1000"),

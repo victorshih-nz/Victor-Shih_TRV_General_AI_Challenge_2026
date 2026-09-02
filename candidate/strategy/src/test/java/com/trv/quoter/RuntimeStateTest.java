@@ -18,7 +18,7 @@ public class RuntimeStateTest {
 
     @BeforeEach
     public void setUp() {
-        metadata = Metadata.parse("AAH6", "ticksize=0.01");
+        metadata = Metadata.parse("AAH6", "ticksize=0.01 ref_price=150 band=100 min_volume=1 max_volume=100 position_limit=200 max_tps=100");
         validBbo = Bbo.parse("1633072800000 AAH6 100 1 200 2", metadata);
         safeRisk = new DeskRiskMessage(1633072800000000000L, 10, "AAH6", 0, 100, 200, HedgerState.SAFE, HedgeDirection.B);
         unknownRisk = new DeskRiskMessage(1633072800000000000L, 10, "AAH6", 0, 100, 200, HedgerState.UNKNOWN, HedgeDirection.B);
@@ -204,7 +204,7 @@ public class RuntimeStateTest {
         Metadata metadata =
             Metadata.parse(
                 "AAH6",
-                "ticksize=1");
+                "ticksize=1 ref_price=105 band=100 min_volume=1 max_volume=100 position_limit=200 max_tps=100");
 
         RuntimeState state =
             new RuntimeState(
@@ -244,7 +244,7 @@ public class RuntimeStateTest {
         Metadata metadata =
             Metadata.parse(
                 "AAH6",
-                "ticksize=1");
+                "ticksize=1 ref_price=105 band=100 min_volume=1 max_volume=100 position_limit=200 max_tps=100");
 
         RuntimeState state =
             new RuntimeState(
@@ -290,7 +290,7 @@ public class RuntimeStateTest {
         Metadata metadata =
             Metadata.parse(
                 "AAH6",
-                "ticksize=1");
+                "ticksize=1 ref_price=105 band=100 min_volume=1 max_volume=100 position_limit=200 max_tps=100");
 
         RuntimeState state =
             new RuntimeState(

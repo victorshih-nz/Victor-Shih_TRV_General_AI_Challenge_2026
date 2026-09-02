@@ -13,12 +13,15 @@ import io.nats.client.api.StreamInfo;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
+import java.util.function.IntSupplier;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -36,6 +39,7 @@ public final class QuoterIntegration implements ConnectionListener {
     private final String sender;
     private final OrderManager orderManager;
     private final OwnLifecycleRouter ownLifecycleRouter;
+    private final LocalRiskLimits localRiskLimits;
 
     private Connection natsConnection;
     private Dispatcher dispatcher;
@@ -81,6 +85,8 @@ public final class QuoterIntegration implements ConnectionListener {
         this.natsUrl = natsUrlEnv;
         this.feed = feedEnv;
         this.sender = senderEnv;
+        this.localRiskLimits =
+            LocalRiskLimits.fromEnvironment();
         this.orderManager = new OrderManager();
         this.ownLifecycleRouter =
             new OwnLifecycleRouter(
@@ -120,6 +126,15 @@ public final class QuoterIntegration implements ConnectionListener {
         natsConnection = Nats.connect(options);
 
         metadata = loadMetadata();
+
+        /*
+         * Exchange metadata can tighten the configured Quoter hard boundary.
+         * Validate that the minimum legal order size can fit inside the
+         * resulting effective hard limit before any order-entry infrastructure
+         * becomes active.
+         */
+        localRiskLimits.validateAgainst(metadata);
+
         runtimeState = new RuntimeState(feed, metadata);
 
         dispatcher = natsConnection.createDispatcher();
@@ -277,10 +292,16 @@ public final class QuoterIntegration implements ConnectionListener {
                 runtimeState,
                 metadata,
                 orderManager,
+                ownLifecycleRouter::ownPosition,
+                localRiskLimits.effectiveSoftPosition(
+                    metadata),
+                localRiskLimits.effectiveHardPosition(
+                    metadata),
                 () -> reconciliationCoordinator != null
                     && reconciliationCoordinator.isHealthy(),
                 addRegistrationLock,
-                this::requestAdd,
+                this::reserveAddCapacity,
+                this::requestReservedAdd,
                 this::requestCancel,
                 () -> {
                     ReconciliationCoordinator coordinator =
@@ -533,6 +554,9 @@ public final class QuoterIntegration implements ConnectionListener {
         try {
             Metadata newMetadata = loadMetadata();
 
+            localRiskLimits.validateAgainst(
+                newMetadata);
+
             if (!metadataEquals(
                     metadata,
                     newMetadata)) {
@@ -781,20 +805,18 @@ public final class QuoterIntegration implements ConnectionListener {
         return m1.getFeed().equals(m2.getFeed())
             && m1.getTickSize()
                 .compareTo(m2.getTickSize()) == 0
-            && ((m1.getRefPrice() == null
-                    && m2.getRefPrice() == null)
-                || (m1.getRefPrice() != null
-                    && m2.getRefPrice() != null
-                    && m1.getRefPrice()
-                        .compareTo(
-                            m2.getRefPrice()) == 0))
-            && ((m1.getBand() == null
-                    && m2.getBand() == null)
-                || (m1.getBand() != null
-                    && m2.getBand() != null
-                    && m1.getBand()
-                        .compareTo(
-                            m2.getBand()) == 0));
+            && m1.getRefPrice()
+                .compareTo(m2.getRefPrice()) == 0
+            && m1.getBand()
+                .compareTo(m2.getBand()) == 0
+            && m1.getMinVolume()
+                == m2.getMinVolume()
+            && m1.getMaxVolume()
+                == m2.getMaxVolume()
+            && m1.getPositionLimit()
+                == m2.getPositionLimit()
+            && m1.getMaxTps()
+                == m2.getMaxTps();
     }
 
     public RuntimeState getRuntimeState() {
@@ -820,6 +842,50 @@ public final class QuoterIntegration implements ConnectionListener {
             int quantity,
             long price) {
 
+        requestAddInternal(
+            side,
+            orderId,
+            quantity,
+            price,
+            null);
+    }
+
+    private OrderRequestClient.AddReservation
+            reserveAddCapacity(
+                int candidateAddCount) {
+
+        return requireOrderRequestClient()
+            .tryReserveAddCapacity(
+                candidateAddCount);
+    }
+
+    private void requestReservedAdd(
+            OrderManager.Side side,
+            String orderId,
+            int quantity,
+            long price,
+            OrderRequestClient.AddReservation reservation) {
+
+        if (reservation == null) {
+            throw new IllegalArgumentException(
+                "Add TPS reservation is required");
+        }
+
+        requestAddInternal(
+            side,
+            orderId,
+            quantity,
+            price,
+            reservation);
+    }
+
+    private void requestAddInternal(
+            OrderManager.Side side,
+            String orderId,
+            int quantity,
+            long price,
+            OrderRequestClient.AddReservation reservation) {
+
         synchronized (addRegistrationLock) {
             ReconciliationCoordinator coordinator =
                 reconciliationCoordinator;
@@ -831,12 +897,42 @@ public final class QuoterIntegration implements ConnectionListener {
 
             coordinator.prepareForNewExposure();
 
-            requireOrderRequestClient()
-                .requestAdd(
-                    side,
-                    orderId,
-                    quantity,
-                    price);
+            /*
+             * Serialize the final local exposure check with authoritative own
+             * T/E accounting. No execution callback can change ownPosition
+             * between this check and the request crossing the transport
+             * dispatch boundary.
+             */
+            synchronized (ownLifecycleRouter) {
+                if (!ownLifecycleRouter.allowsLocalAdd(
+                        side,
+                        quantity,
+                        localRiskLimits.effectiveSoftPosition(
+                            metadata),
+                        localRiskLimits.effectiveHardPosition(
+                            metadata))) {
+
+                    return;
+                }
+
+                OrderRequestClient client =
+                    requireOrderRequestClient();
+
+                if (reservation == null) {
+                    client.requestAdd(
+                        side,
+                        orderId,
+                        quantity,
+                        price);
+                } else {
+                    client.requestAdd(
+                        side,
+                        orderId,
+                        quantity,
+                        price,
+                        reservation);
+                }
+            }
         }
     }
 
@@ -954,6 +1050,172 @@ public final class QuoterIntegration implements ConnectionListener {
         return Metadata.parse(feed, payload);
     }
 
+    static record LocalRiskLimits(
+        int softPosition,
+        int hardPosition,
+        int deskHardPosition) {
+
+        private static final int DEFAULT_QUOTER_SOFT_POS = 6;
+        private static final int DEFAULT_QUOTER_HARD_POS = 12;
+        private static final int DEFAULT_DESK_HARD_POS = 15;
+
+        LocalRiskLimits {
+            if (softPosition <= 0) {
+                throw new IllegalArgumentException(
+                    "QUOTER_SOFT_POS must be positive");
+            }
+
+            if (hardPosition <= softPosition) {
+                throw new IllegalArgumentException(
+                    "QUOTER_HARD_POS must exceed QUOTER_SOFT_POS");
+            }
+
+            if (deskHardPosition <= 0) {
+                throw new IllegalArgumentException(
+                    "DESK_HARD_POS must be positive");
+            }
+
+            /*
+             * Company v1 explicitly requires:
+             * QUOTER_HARD_POS <= DESK_HARD_POS.
+             */
+            if (hardPosition > deskHardPosition) {
+                throw new IllegalArgumentException(
+                    "QUOTER_HARD_POS must not exceed DESK_HARD_POS");
+            }
+        }
+
+        static LocalRiskLimits fromEnvironment() {
+            return fromMap(
+                System.getenv());
+        }
+
+        static LocalRiskLimits fromMap(
+                Map<String, String> env) {
+
+            Objects.requireNonNull(
+                env,
+                "env is required");
+
+            int soft =
+                readPositiveInt(
+                    env,
+                    "QUOTER_SOFT_POS",
+                    DEFAULT_QUOTER_SOFT_POS);
+
+            int hard =
+                readPositiveInt(
+                    env,
+                    "QUOTER_HARD_POS",
+                    DEFAULT_QUOTER_HARD_POS);
+
+            int deskHard =
+                readPositiveInt(
+                    env,
+                    "DESK_HARD_POS",
+                    DEFAULT_DESK_HARD_POS);
+
+            return new LocalRiskLimits(
+                soft,
+                hard,
+                deskHard);
+        }
+
+        int effectiveHardPosition(
+                Metadata metadata) {
+
+            Objects.requireNonNull(
+                metadata,
+                "metadata is required");
+
+            if (!metadata.isValid()) {
+                throw new IllegalArgumentException(
+                    "metadata must be valid");
+            }
+
+            return Math.min(
+                hardPosition,
+                metadata.getPositionLimit());
+        }
+
+        int effectiveSoftPosition(
+                Metadata metadata) {
+
+            int effectiveHard =
+                effectiveHardPosition(
+                    metadata);
+
+            /*
+             * Preserve an interior soft buffer whenever the Exchange position
+             * limit allows one. For the degenerate hard=1 case, soft=1 is the
+             * narrowest positive threshold; the signed hard envelope remains
+             * the final safety barrier.
+             */
+            int exchangeBoundSoft =
+                Math.max(
+                    1,
+                    effectiveHard - 1);
+
+            return Math.min(
+                softPosition,
+                exchangeBoundSoft);
+        }
+
+        void validateAgainst(
+                Metadata metadata) {
+
+            int effectiveHard =
+                effectiveHardPosition(
+                    metadata);
+
+            if (metadata.getMinVolume()
+                    > effectiveHard) {
+
+                throw new IllegalArgumentException(
+                    "metadata min_volume "
+                        + metadata.getMinVolume()
+                        + " exceeds effective Quoter hard position "
+                        + effectiveHard
+                        + "; no legal initial quote can fit "
+                        + "inside the local hard-risk envelope");
+            }
+        }
+
+        private static int readPositiveInt(
+                Map<String, String> env,
+                String name,
+                int defaultValue) {
+
+            String raw =
+                env.get(name);
+
+            if (raw == null
+                    || raw.isBlank()) {
+
+                return defaultValue;
+            }
+
+            final int parsed;
+
+            try {
+                parsed =
+                    Integer.parseInt(
+                        raw.trim());
+            } catch (NumberFormatException e) {
+                throw new IllegalArgumentException(
+                    name + " must be an integer",
+                    e);
+            }
+
+            if (parsed <= 0) {
+                throw new IllegalArgumentException(
+                    name + " must be positive");
+            }
+
+            return parsed;
+        }
+    }
+
     /**
      * Serialized production quote orchestrator.
      *
@@ -974,6 +1236,22 @@ public final class QuoterIntegration implements ConnectionListener {
         }
 
         @FunctionalInterface
+        interface ReserveAddAction {
+            OrderRequestClient.AddReservation reserve(
+                int candidateAddCount);
+        }
+
+        @FunctionalInterface
+        interface ReservedAddAction {
+            void add(
+                OrderManager.Side side,
+                String orderId,
+                int quantity,
+                long price,
+                OrderRequestClient.AddReservation reservation);
+        }
+
+        @FunctionalInterface
         interface CancelAction {
             void cancel(
                 OrderManager.Side side);
@@ -984,9 +1262,12 @@ public final class QuoterIntegration implements ConnectionListener {
         private final QuoteController quoteController;
         private final OrderManager orderManager;
         private final OrderIdGenerator orderIdGenerator;
+        private final IntSupplier ownPositionSupplier;
         private final BooleanSupplier reconciliationHealthy;
         private final Object addRegistrationLock;
         private final AddAction addAction;
+        private final ReserveAddAction reserveAddAction;
+        private final ReservedAddAction reservedAddAction;
         private final CancelAction cancelAction;
         private final Runnable recoverySignal;
 
@@ -1003,6 +1284,96 @@ public final class QuoterIntegration implements ConnectionListener {
                 CancelAction cancelAction,
                 Runnable recoverySignal) {
 
+            this(
+                runtimeState,
+                metadata,
+                orderManager,
+                () -> 0,
+                6,
+                12,
+                reconciliationHealthy,
+                addRegistrationLock,
+                addAction,
+                null,
+                null,
+                cancelAction,
+                recoverySignal);
+        }
+
+        AutomaticQuoteEngine(
+                RuntimeState runtimeState,
+                Metadata metadata,
+                OrderManager orderManager,
+                IntSupplier ownPositionSupplier,
+                int quoterSoftPosition,
+                int quoterHardPosition,
+                BooleanSupplier reconciliationHealthy,
+                Object addRegistrationLock,
+                AddAction addAction,
+                CancelAction cancelAction,
+                Runnable recoverySignal) {
+
+            this(
+                runtimeState,
+                metadata,
+                orderManager,
+                ownPositionSupplier,
+                quoterSoftPosition,
+                quoterHardPosition,
+                reconciliationHealthy,
+                addRegistrationLock,
+                addAction,
+                null,
+                null,
+                cancelAction,
+                recoverySignal);
+        }
+
+        AutomaticQuoteEngine(
+                RuntimeState runtimeState,
+                Metadata metadata,
+                OrderManager orderManager,
+                IntSupplier ownPositionSupplier,
+                int quoterSoftPosition,
+                int quoterHardPosition,
+                BooleanSupplier reconciliationHealthy,
+                Object addRegistrationLock,
+                ReserveAddAction reserveAddAction,
+                ReservedAddAction reservedAddAction,
+                CancelAction cancelAction,
+                Runnable recoverySignal) {
+
+            this(
+                runtimeState,
+                metadata,
+                orderManager,
+                ownPositionSupplier,
+                quoterSoftPosition,
+                quoterHardPosition,
+                reconciliationHealthy,
+                addRegistrationLock,
+                null,
+                reserveAddAction,
+                reservedAddAction,
+                cancelAction,
+                recoverySignal);
+        }
+
+        private AutomaticQuoteEngine(
+                RuntimeState runtimeState,
+                Metadata metadata,
+                OrderManager orderManager,
+                IntSupplier ownPositionSupplier,
+                int quoterSoftPosition,
+                int quoterHardPosition,
+                BooleanSupplier reconciliationHealthy,
+                Object addRegistrationLock,
+                AddAction addAction,
+                ReserveAddAction reserveAddAction,
+                ReservedAddAction reservedAddAction,
+                CancelAction cancelAction,
+                Runnable recoverySignal) {
+
             this.runtimeState =
                 Objects.requireNonNull(
                     runtimeState,
@@ -1013,11 +1384,25 @@ public final class QuoterIntegration implements ConnectionListener {
                     orderManager,
                     "orderManager is required");
 
+            this.ownPositionSupplier =
+                Objects.requireNonNull(
+                    ownPositionSupplier,
+                    "ownPositionSupplier is required");
+
+            if (quoterSoftPosition <= 0
+                    || quoterHardPosition < quoterSoftPosition) {
+
+                throw new IllegalArgumentException(
+                    "invalid Quoter local position limits");
+            }
+
             this.quotePolicy =
                 new QuotePolicy(
                     Objects.requireNonNull(
                         metadata,
-                        "metadata is required"));
+                        "metadata is required"),
+                    quoterSoftPosition,
+                    quoterHardPosition);
 
             this.quoteController =
                 new QuoteController(
@@ -1037,10 +1422,21 @@ public final class QuoterIntegration implements ConnectionListener {
                     addRegistrationLock,
                     "addRegistrationLock is required");
 
-            this.addAction =
-                Objects.requireNonNull(
-                    addAction,
-                    "addAction is required");
+            boolean legacyMode =
+                addAction != null;
+
+            boolean reservedMode =
+                reserveAddAction != null
+                    && reservedAddAction != null;
+
+            if (legacyMode == reservedMode) {
+                throw new IllegalArgumentException(
+                    "exactly one Add dispatch mode is required");
+            }
+
+            this.addAction = addAction;
+            this.reserveAddAction = reserveAddAction;
+            this.reservedAddAction = reservedAddAction;
 
             this.cancelAction =
                 Objects.requireNonNull(
@@ -1090,10 +1486,15 @@ public final class QuoterIntegration implements ConnectionListener {
                     snapshot.bboVersion()
                         != lastEvaluatedBboVersion;
 
+                int ownPosition =
+                    ownPositionSupplier
+                        .getAsInt();
+
                 plan =
                     quotePolicy.evaluate(
                         snapshot.bbo(),
                         snapshot.risk(),
+                        ownPosition,
                         newBboObservation);
 
                 lastEvaluatedBboVersion =
@@ -1150,7 +1551,7 @@ public final class QuoterIntegration implements ConnectionListener {
             if (bidAdd && askAdd) {
                 dispatchSafePair(
                     decision,
-                    latest.risk());
+                    latest);
                 return;
             }
 
@@ -1221,38 +1622,50 @@ public final class QuoterIntegration implements ConnectionListener {
                     "ADD decision has no price");
             }
 
-            String orderId =
-                orderIdGenerator.nextId();
+            OrderRequestClient.AddReservation reservation =
+                reserveAddCapacityIfRequired(1);
 
-            try {
-                addAction.add(
-                    side,
-                    orderId,
-                    QuotePolicy.QUOTE_CLIP,
-                    price);
-            } catch (RuntimeException e) {
-                forceRecoveryForCurrent(
-                    side,
-                    orderId,
-                    "automatic quote Add failed",
-                    e);
+            if (requiresTpsReservation()
+                    && reservation == null) {
+
                 return;
             }
 
-            if (isCurrentUnknown(
-                    side,
-                    orderId)) {
+            try (reservation) {
+                String orderId =
+                    orderIdGenerator.nextId();
 
-                recoverySignal.run();
+                try {
+                    performAdd(
+                        side,
+                        orderId,
+                        quotePolicy.normalQuoteQuantity(),
+                        price,
+                        reservation);
+                } catch (RuntimeException e) {
+                    forceRecoveryForCurrent(
+                        side,
+                        orderId,
+                        "automatic quote Add failed",
+                        e);
+                    return;
+                }
+
+                if (isCurrentUnknown(
+                        side,
+                        orderId)) {
+
+                    recoverySignal.run();
+                }
             }
         }
 
         private void dispatchSafePair(
                 QuoteController.Decision decision,
-                DeskRiskMessage risk) {
+                RuntimeState.Snapshot baseline) {
 
             OrderManager.Side first =
-                preferredFirstSide(risk);
+                preferredFirstSide();
 
             OrderManager.Side second =
                 opposite(first);
@@ -1282,106 +1695,190 @@ public final class QuoterIntegration implements ConnectionListener {
                     "SAFE pair ADD decision is missing a price");
             }
 
+            OrderRequestClient.AddReservation reservation =
+                reserveAddCapacityIfRequired(2);
+
+            if (requiresTpsReservation()
+                    && reservation == null) {
+
+                return;
+            }
+
             /*
-             * The exchange protocol has no atomic two-order request. Serialize
-             * both Add registrations against the same exposure-floor lock.
-             *
-             * At non-zero SAFE inventory, send the risk-reducing side first.
-             * At zero inventory BID is the deterministic first side.
+             * The Exchange has no atomic two-order request. TPS capacity for
+             * both Adds is reserved atomically before the first transport
+             * attempt, then each side still passes final trading-safety checks.
              */
-            synchronized (addRegistrationLock) {
-                String firstId =
-                    orderIdGenerator.nextId();
+            try (reservation) {
+                synchronized (addRegistrationLock) {
+                    String firstId =
+                        orderIdGenerator.nextId();
 
-                try {
-                    addAction.add(
-                        first,
-                        firstId,
-                        QuotePolicy.QUOTE_CLIP,
-                        firstPrice);
-                } catch (RuntimeException e) {
-                    forceRecoveryForCurrent(
-                        first,
-                        firstId,
-                        "first SAFE pair Add failed",
-                        e);
-                    return;
-                }
+                    try {
+                        performAdd(
+                            first,
+                            firstId,
+                            quotePolicy.normalQuoteQuantity(),
+                            firstPrice,
+                            reservation);
+                    } catch (RuntimeException e) {
+                        forceRecoveryForCurrent(
+                            first,
+                            firstId,
+                            "first SAFE pair Add failed",
+                            e);
+                        return;
+                    }
 
-                if (!isLiveAddState(
-                        first,
-                        firstId)) {
-
-                    if (isCurrentOccupied(
+                    if (!isLiveAddState(
                             first,
                             firstId)) {
+
+                        if (isCurrentOccupied(
+                                first,
+                                firstId)) {
+
+                            forceRecoveryForCurrent(
+                                first,
+                                firstId,
+                                "first SAFE pair Add did not remain live",
+                                null);
+                        }
+
+                        return;
+                    }
+
+                    /*
+                     * Reservation guarantees capacity, not permission to trade.
+                     * A BBO/risk/reconciliation change after the first Add must
+                     * prevent the stale second Add. The unused token is released
+                     * by try-with-resources and the first order enters existing
+                     * recovery so SAFE does not remain accidentally one-sided.
+                     */
+                    if (!safePairInputsStillCurrent(
+                            baseline)) {
 
                         forceRecoveryForCurrent(
                             first,
                             firstId,
-                            "first SAFE pair Add did not remain live",
+                            "SAFE pair invalidated before second Add",
                             null);
+                        return;
                     }
 
-                    return;
-                }
+                    String secondId =
+                        orderIdGenerator.nextId();
 
-                String secondId =
-                    orderIdGenerator.nextId();
-
-                try {
-                    addAction.add(
-                        second,
-                        secondId,
-                        QuotePolicy.QUOTE_CLIP,
-                        secondPrice);
-                } catch (RuntimeException e) {
-                    abortPairToRecovery(
-                        first,
-                        firstId,
-                        second,
-                        secondId,
-                        "second SAFE pair Add failed",
-                        e);
-                    return;
-                }
-
-                /*
-                 * A/T/C can race either request. A successful pair handoff
-                 * requires both sides to remain PENDING_ADD or ACTIVE after the
-                 * second dispatch. Otherwise deliberately stop quoting and let
-                 * exact-cancel/replay reconciliation flatten the orphan.
-                 */
-                if (!isLiveAddState(
-                        first,
-                        firstId)
-                        || !isLiveAddState(
+                    try {
+                        performAdd(
                             second,
-                            secondId)) {
+                            secondId,
+                            quotePolicy.normalQuoteQuantity(),
+                            secondPrice,
+                            reservation);
+                    } catch (RuntimeException e) {
+                        abortPairToRecovery(
+                            first,
+                            firstId,
+                            second,
+                            secondId,
+                            "second SAFE pair Add failed",
+                            e);
+                        return;
+                    }
 
-                    abortPairToRecovery(
-                        first,
-                        firstId,
-                        second,
-                        secondId,
-                        "SAFE pair became asymmetric during dispatch",
-                        null);
+                    if (!isLiveAddState(
+                            first,
+                            firstId)
+                            || !isLiveAddState(
+                                second,
+                                secondId)) {
+
+                        abortPairToRecovery(
+                            first,
+                            firstId,
+                            second,
+                            secondId,
+                            "SAFE pair became asymmetric during dispatch",
+                            null);
+                    }
                 }
             }
         }
 
-        private OrderManager.Side preferredFirstSide(
-                DeskRiskMessage risk) {
+        private boolean safePairInputsStillCurrent(
+                RuntimeState.Snapshot baseline) {
 
-            if (risk != null
-                    && risk.getNetPosition() > 0) {
+            if (baseline == null
+                    || !baseline.ready()
+                    || !reconciliationHealthy
+                        .getAsBoolean()) {
 
+                return false;
+            }
+
+            RuntimeState.Snapshot latest =
+                runtimeState.snapshot();
+
+            return latest.ready()
+                && latest.bboVersion()
+                    == baseline.bboVersion()
+                && latest.riskVersion()
+                    == baseline.riskVersion()
+                && reconciliationHealthy
+                    .getAsBoolean();
+        }
+
+        private boolean requiresTpsReservation() {
+            return reserveAddAction != null;
+        }
+
+        private OrderRequestClient.AddReservation
+                reserveAddCapacityIfRequired(
+                    int candidateAddCount) {
+
+            if (!requiresTpsReservation()) {
+                return null;
+            }
+
+            return reserveAddAction.reserve(
+                candidateAddCount);
+        }
+
+        private void performAdd(
+                OrderManager.Side side,
+                String orderId,
+                int quantity,
+                long price,
+                OrderRequestClient.AddReservation reservation) {
+
+            if (requiresTpsReservation()) {
+                reservedAddAction.add(
+                    side,
+                    orderId,
+                    quantity,
+                    price,
+                    reservation);
+                return;
+            }
+
+            addAction.add(
+                side,
+                orderId,
+                quantity,
+                price);
+        }
+
+        private OrderManager.Side preferredFirstSide() {
+            int ownPosition =
+                ownPositionSupplier
+                    .getAsInt();
+
+            if (ownPosition > 0) {
                 return OrderManager.Side.ASK;
             }
 
-            if (risk != null
-                    && risk.getNetPosition() < 0) {
-
+            if (ownPosition < 0) {
                 return OrderManager.Side.BID;
             }
 
@@ -1598,8 +2095,31 @@ public final class QuoterIntegration implements ConnectionListener {
         private final int maxExecutionDedupEntries;
         private final Runnable lifecycleStateChanged;
 
+        /*
+        * Lifecycle dedup protects OrderManager updates inside the current
+        * reconciliation epoch. Reconciliation may clear this set only after both
+        * order slots are authoritatively EMPTY.
+        */
         private final Set<ExecutionKey>
             executionDedup = new HashSet<>();
+
+        /*
+        * Inventory accounting has a different lifetime from order lifecycle.
+        *
+        * Keep a bounded access-order window of recent authoritative executions.
+        * Capacity turnover is normal operation: evict the least-recently-used key
+        * instead of stopping position accounting.
+        *
+        * This cache is deliberately NOT cleared by lifecycle reconciliation.
+        */
+        private final LinkedHashMap<ExecutionKey, Boolean>
+            accountingDedup =
+                new LinkedHashMap<>(
+                    16,
+                    0.75f,
+                    true);
+
+        private int ownPosition;
 
         OwnLifecycleRouter(
                 String sender,
@@ -1693,6 +2213,79 @@ public final class QuoterIntegration implements ConnectionListener {
                 markAllOccupiedUnknown();
             } finally {
                 lifecycleStateChanged.run();
+            }
+        }
+
+        synchronized int ownPosition() {
+            return ownPosition;
+        }
+
+        synchronized boolean allowsLocalAdd(
+                OrderManager.Side side,
+                int quantity,
+                int softPosition,
+                int hardPosition) {
+
+            Objects.requireNonNull(
+                side,
+                "side is required");
+
+            if (quantity <= 0) {
+                throw new IllegalArgumentException(
+                    "quantity must be positive");
+            }
+
+            if (softPosition <= 0
+                    || hardPosition < softPosition) {
+
+                throw new IllegalArgumentException(
+                    "invalid effective local position limits");
+            }
+
+            /*
+             * Once actual own inventory reaches local soft, suppress only the
+             * side that can increase that inventory. Risk-reducing one-sided
+             * quoting remains permitted.
+             */
+            if (side == OrderManager.Side.BID
+                    && ownPosition >= softPosition) {
+
+                return false;
+            }
+
+            if (side == OrderManager.Side.ASK
+                    && ownPosition <= -softPosition) {
+
+                return false;
+            }
+
+            synchronized (orderManager) {
+                long bidExposure =
+                    orderManager.remainingQty(
+                        OrderManager.Side.BID);
+
+                long askExposure =
+                    orderManager.remainingQty(
+                        OrderManager.Side.ASK);
+
+                if (side == OrderManager.Side.BID) {
+                    bidExposure +=
+                        quantity;
+                } else {
+                    askExposure +=
+                        quantity;
+                }
+
+                long upperBound =
+                    (long) ownPosition
+                        + bidExposure;
+
+                long lowerBound =
+                    (long) ownPosition
+                        - askExposure;
+
+                return upperBound <= hardPosition
+                    && lowerBound >= -((long) hardPosition);
             }
         }
 
@@ -1900,6 +2493,7 @@ public final class QuoterIntegration implements ConnectionListener {
 
             ExecutionKey key =
                 new ExecutionKey(
+                    sender,
                     eventType,
                     eventTimestamp,
                     matchId,
@@ -1908,6 +2502,16 @@ public final class QuoterIntegration implements ConnectionListener {
                     quantity,
                     price,
                     aggressorSide);
+
+            /*
+             * Authoritative own execution accounting is independent from the
+             * current local order slot. A valid late/non-current execution must
+             * still change Quoter inventory.
+             */
+            applyOwnInventoryExecution(
+                key,
+                side,
+                quantity);
 
             synchronized (orderManager) {
                 if (!isCurrentOnExpectedSide(
@@ -1940,6 +2544,53 @@ public final class QuoterIntegration implements ConnectionListener {
                     tracked.orderId(),
                     quantity);
             }
+        }
+
+        private void applyOwnInventoryExecution(
+                ExecutionKey key,
+                OrderManager.Side side,
+                int quantity) {
+
+            /*
+             * Access-order lookup keeps a recently redelivered duplicate in the
+             * bounded replay-protection window.
+             */
+            if (accountingDedup.get(key) != null) {
+                return;
+            }
+
+            int delta =
+                side == OrderManager.Side.BID
+                    ? quantity
+                    : -quantity;
+
+            int nextPosition =
+                Math.addExact(
+                    ownPosition,
+                    delta);
+
+            if (accountingDedup.size()
+                    >= maxExecutionDedupEntries) {
+
+                var iterator =
+                    accountingDedup
+                        .keySet()
+                        .iterator();
+
+                if (!iterator.hasNext()) {
+                    throw new IllegalStateException(
+                        "accounting dedup eviction failed");
+                }
+
+                iterator.next();
+                iterator.remove();
+            }
+
+            accountingDedup.put(
+                key,
+                Boolean.TRUE);
+
+            ownPosition = nextPosition;
         }
 
         private boolean isCurrentOnExpectedSide(
@@ -2137,10 +2788,11 @@ public final class QuoterIntegration implements ConnectionListener {
         }
 
         /*
-         * executionDedup is cleared only by
-         * clearExecutionDedupForReconciledEpoch(), after authoritative
-         * reconciliation has completed with both slots EMPTY. It is never
-         * cleared merely because reconnect/resubscribe occurred.
+         * executionDedup is the current-order lifecycle dedup. Reconciliation
+         * may clear it only after both slots are authoritatively EMPTY.
+         *
+         * accountingDedup is separate, bounded LRU state for signed own
+         * inventory and is never cleared by lifecycle reconciliation.
          */
 
         private record PublicOrderId(
@@ -2153,6 +2805,7 @@ public final class QuoterIntegration implements ConnectionListener {
         }
 
         private record ExecutionKey(
+            String trackedSender,
             String eventType,
             long eventTimestamp,
             String matchId,

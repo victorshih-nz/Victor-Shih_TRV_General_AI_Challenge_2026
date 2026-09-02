@@ -80,7 +80,6 @@ class QuotePolicyTest {
                     HedgerState.SAFE,
                     HedgeDirection.X));
 
-        // weighted mid 102.0 + imbalance 0.5 tick
         assertBigDecimal(
             "102.5",
             plan.rawFair());
@@ -119,7 +118,6 @@ class QuotePolicyTest {
                     HedgerState.SAFE,
                     HedgeDirection.X));
 
-        // RawFair = 112.0; EWMA = 0.2*112 + 0.8*102 = 104.
         assertBigDecimal(
             "104.00",
             second.ewmaFair());
@@ -161,9 +159,12 @@ class QuotePolicyTest {
     }
 
     @Test
-    void fullPositiveInventorySkewsFairDownByOnePointFiveTicks() {
+    void fullPositiveOwnInventorySkewsFairDownByOnePointFiveTicks() {
         QuotePolicy policy =
-            new QuotePolicy(metadata);
+            new QuotePolicy(
+                metadata,
+                6,
+                12);
 
         QuotePolicy.QuotePlan plan =
             policy.evaluate(
@@ -173,26 +174,152 @@ class QuotePolicyTest {
                     110,
                     10),
                 risk(
-                    5,
+                    0,
                     HedgerState.SAFE,
-                    HedgeDirection.S));
+                    HedgeDirection.X),
+                12);
 
         assertBigDecimal(
             "100.5",
             plan.finalFair());
 
-        // Position-derived band fails closed to EMERGENCY.
-        assertEquals(
-            HedgerState.EMERGENCY,
-            plan.effectiveRisk());
+        /*
+         * Local long inventory is already through soft, so BID is suppressed
+         * while the risk-reducing ASK remains eligible.
+         */
         assertNull(
             plan.bidPrice());
+        assertTrue(
+            plan.hasAsk());
+    }
+
+    @Test
+    void combinedDeskNetDoesNotActAsQuoterInventorySkew() {
+        QuotePolicy policy =
+            new QuotePolicy(
+                metadata,
+                6,
+                12);
+
+        QuotePolicy.QuotePlan plan =
+            policy.evaluate(
+                bbo(
+                    100,
+                    10,
+                    110,
+                    10),
+                risk(
+                    2,
+                    HedgerState.SAFE,
+                    HedgeDirection.X),
+                0);
+
+        assertBigDecimal(
+            "102.0",
+            plan.finalFair());
+    }
+
+    @Test
+    void positiveSoftOwnInventorySuppressesRiskIncreasingBid() {
+        QuotePolicy policy =
+            new QuotePolicy(
+                metadata,
+                6,
+                12);
+
+        QuotePolicy.QuotePlan plan =
+            policy.evaluate(
+                bbo(
+                    100,
+                    10,
+                    110,
+                    10),
+                risk(
+                    0,
+                    HedgerState.SAFE,
+                    HedgeDirection.X),
+                6);
+
+        assertFalse(
+            plan.isAllowed(
+                OrderManager.Side.BID));
+        assertTrue(
+            plan.isAllowed(
+                OrderManager.Side.ASK));
+        assertNull(
+            plan.bidPrice());
+        assertTrue(
+            plan.hasAsk());
+    }
+
+    @Test
+    void negativeSoftOwnInventorySuppressesRiskIncreasingAsk() {
+        QuotePolicy policy =
+            new QuotePolicy(
+                metadata,
+                6,
+                12);
+
+        QuotePolicy.QuotePlan plan =
+            policy.evaluate(
+                bbo(
+                    100,
+                    10,
+                    110,
+                    10),
+                risk(
+                    0,
+                    HedgerState.SAFE,
+                    HedgeDirection.X),
+                -6);
+
+        assertTrue(
+            plan.isAllowed(
+                OrderManager.Side.BID));
+        assertFalse(
+            plan.isAllowed(
+                OrderManager.Side.ASK));
+        assertTrue(
+            plan.hasBid());
         assertNull(
             plan.askPrice());
     }
 
     @Test
-    void safeDoesNotInitiateOneSidedPairWhenOnlyAskIsProfitable() {
+    void localAndDeskDirectionConflictFailsClosed() {
+        QuotePolicy policy =
+            new QuotePolicy(
+                metadata,
+                6,
+                12);
+
+        /*
+         * Desk is short / asks Quoter not to increase short exposure by
+         * selling; CONTROLLED therefore permits BID only.
+         * Quoter itself is long at soft and locally permits ASK only.
+         * Permission intersection is empty.
+         */
+        QuotePolicy.QuotePlan plan =
+            policy.evaluate(
+                bbo(
+                    100,
+                    10,
+                    110,
+                    10),
+                risk(
+                    -3,
+                    HedgerState.CONTROLLED,
+                    HedgeDirection.B),
+                6);
+
+        assertFalse(
+            plan.hasBid());
+        assertFalse(
+            plan.hasAsk());
+    }
+
+    @Test
+    void safeDoesNotInitiateOneSidedPairWhenOnlyAskIsProfitableAndLocalInventoryNormal() {
         QuotePolicy policy =
             new QuotePolicy(metadata);
 
@@ -208,11 +335,6 @@ class QuotePolicyTest {
                     HedgerState.SAFE,
                     HedgeDirection.X));
 
-        /*
-         * Weighted fair = 100.2.
-         * BID 100 has only 0.2 tick edge, ASK 101 has 0.8.
-         * SAFE therefore opens neither side.
-         */
         assertNull(
             plan.bidPrice());
         assertNull(
@@ -220,7 +342,7 @@ class QuotePolicyTest {
     }
 
     @Test
-    void controlledPositivePositionPermitsOnlyRiskReducingAsk() {
+    void controlledPositiveDeskPositionPermitsOnlyRiskReducingAsk() {
         QuotePolicy policy =
             new QuotePolicy(metadata);
 
@@ -243,7 +365,7 @@ class QuotePolicyTest {
     }
 
     @Test
-    void controlledNegativePositionPermitsOnlyRiskReducingBid() {
+    void controlledNegativeDeskPositionPermitsOnlyRiskReducingBid() {
         QuotePolicy policy =
             new QuotePolicy(metadata);
 
@@ -289,7 +411,7 @@ class QuotePolicyTest {
     }
 
     @Test
-    void emergencyNeverAdds() {
+    void emergencyPermitsOnlyDeskRiskReducingSideWhenSemanticsAreConsistent() {
         QuotePolicy policy =
             new QuotePolicy(metadata);
 
@@ -303,16 +425,17 @@ class QuotePolicyTest {
                 risk(
                     5,
                     HedgerState.EMERGENCY,
-                    HedgeDirection.S));
+                    HedgeDirection.S),
+                0);
 
         assertFalse(
             plan.hasBid());
-        assertFalse(
+        assertTrue(
             plan.hasAsk());
     }
 
     @Test
-    void moreSeverePositionBandCannotBeDowngradedByReportedSafeState() {
+    void reportedSafeDeskStateIsNotReclassifiedFromDeskNetPosition() {
         QuotePolicy policy =
             new QuotePolicy(metadata);
 
@@ -324,16 +447,245 @@ class QuotePolicyTest {
                     110,
                     10),
                 risk(
-                    3,
+                    4,
                     HedgerState.SAFE,
-                    HedgeDirection.S));
+                    HedgeDirection.X),
+                0);
 
         assertEquals(
-            HedgerState.CONTROLLED,
+            HedgerState.SAFE,
             plan.effectiveRisk());
-        assertNull(
-            plan.bidPrice());
         assertTrue(
+            plan.hasBid());
+        assertTrue(
+            plan.hasAsk());
+    }
+
+    @Test
+    void safeWithDirectionalSignalFailsClosed() {
+        QuotePolicy policy =
+            new QuotePolicy(metadata);
+
+        QuotePolicy.QuotePlan plan =
+            policy.evaluate(
+                bbo(
+                    100,
+                    10,
+                    110,
+                    10),
+                risk(
+                    0,
+                    HedgerState.SAFE,
+                    HedgeDirection.S),
+                0);
+
+        assertFalse(
+            plan.hasBid());
+        assertFalse(
+            plan.hasAsk());
+    }
+
+    @Test
+    void zeroNetControlledFailsClosed() {
+        QuotePolicy policy =
+            new QuotePolicy(metadata);
+
+        QuotePolicy.QuotePlan plan =
+            policy.evaluate(
+                bbo(
+                    100,
+                    10,
+                    110,
+                    10),
+                risk(
+                    0,
+                    HedgerState.CONTROLLED,
+                    HedgeDirection.S),
+                0);
+
+        assertFalse(
+            plan.hasBid());
+        assertFalse(
+            plan.hasAsk());
+    }
+
+    @Test
+    void zeroNetEmergencyFailsClosed() {
+        QuotePolicy policy =
+            new QuotePolicy(metadata);
+
+        QuotePolicy.QuotePlan plan =
+            policy.evaluate(
+                bbo(
+                    100,
+                    10,
+                    110,
+                    10),
+                risk(
+                    0,
+                    HedgerState.EMERGENCY,
+                    HedgeDirection.B),
+                0);
+
+        assertFalse(
+            plan.hasBid());
+        assertFalse(
+            plan.hasAsk());
+    }
+
+    @Test
+    void emergencyPositiveDeskPositionPermitsOnlyAskWhenLocalRiskAgrees() {
+        QuotePolicy policy =
+            new QuotePolicy(
+                metadata,
+                6,
+                12);
+
+        QuotePolicy.QuotePlan plan =
+            policy.evaluate(
+                bbo(
+                    100,
+                    10,
+                    110,
+                    10),
+                risk(
+                    4,
+                    HedgerState.EMERGENCY,
+                    HedgeDirection.S),
+                6);
+
+        assertFalse(
+            plan.hasBid());
+        assertTrue(
+            plan.hasAsk());
+    }
+
+    @Test
+    void emergencyDeskLongConflictsWithLocalShortAndPausesAdds() {
+        QuotePolicy policy =
+            new QuotePolicy(
+                metadata,
+                6,
+                12);
+
+        QuotePolicy.QuotePlan plan =
+            policy.evaluate(
+                bbo(
+                    100,
+                    10,
+                    110,
+                    10),
+                risk(
+                    4,
+                    HedgerState.EMERGENCY,
+                    HedgeDirection.S),
+                -6);
+
+        assertFalse(
+            plan.hasBid());
+        assertFalse(
+            plan.hasAsk());
+    }
+
+    @Test
+    void controlledDeskLongConflictsWithLocalShortAndPausesAdds() {
+        QuotePolicy policy =
+            new QuotePolicy(
+                metadata,
+                6,
+                12);
+
+        QuotePolicy.QuotePlan plan =
+            policy.evaluate(
+                bbo(
+                    100,
+                    10,
+                    110,
+                    10),
+                risk(
+                    4,
+                    HedgerState.CONTROLLED,
+                    HedgeDirection.S),
+                -6);
+
+        assertFalse(
+            plan.hasBid());
+        assertFalse(
+            plan.hasAsk());
+    }
+
+    @Test
+    void contradictoryControlledDirectionFailsClosed() {
+        QuotePolicy policy =
+            new QuotePolicy(metadata);
+
+        QuotePolicy.QuotePlan plan =
+            policy.evaluate(
+                bbo(
+                    100,
+                    10,
+                    110,
+                    10),
+                risk(
+                    4,
+                    HedgerState.CONTROLLED,
+                    HedgeDirection.B),
+                0);
+
+        assertFalse(
+            plan.hasBid());
+        assertFalse(
+            plan.hasAsk());
+    }
+
+    @Test
+    void contradictoryEmergencyDirectionFailsClosed() {
+        QuotePolicy policy =
+            new QuotePolicy(metadata);
+
+        QuotePolicy.QuotePlan plan =
+            policy.evaluate(
+                bbo(
+                    100,
+                    10,
+                    110,
+                    10),
+                risk(
+                    -4,
+                    HedgerState.EMERGENCY,
+                    HedgeDirection.S),
+                0);
+
+        assertFalse(
+            plan.hasBid());
+        assertFalse(
+            plan.hasAsk());
+    }
+
+    @Test
+    void unknownNeverAddsRegardlessOfLocalInventory() {
+        QuotePolicy policy =
+            new QuotePolicy(
+                metadata,
+                6,
+                12);
+
+        QuotePolicy.QuotePlan plan =
+            policy.evaluate(
+                bbo(
+                    100,
+                    10,
+                    110,
+                    10),
+                risk(
+                    4,
+                    HedgerState.UNKNOWN,
+                    HedgeDirection.S),
+                0);
+
+        assertFalse(
+            plan.hasBid());
+        assertFalse(
             plan.hasAsk());
     }
 
@@ -372,9 +724,12 @@ class QuotePolicyTest {
     }
 
     @Test
-    void reevaluationOfSameMarketDoesNotAdvanceEwma() {
+    void reevaluationOfSameMarketDoesNotAdvanceEwmaButRecomputesOwnInventory() {
         QuotePolicy policy =
-            new QuotePolicy(metadata);
+            new QuotePolicy(
+                metadata,
+                6,
+                12);
 
         QuotePolicy.QuotePlan first =
             policy.evaluate(
@@ -387,6 +742,7 @@ class QuotePolicyTest {
                     0,
                     HedgerState.SAFE,
                     HedgeDirection.X),
+                0,
                 true);
 
         assertBigDecimal(
@@ -401,24 +757,21 @@ class QuotePolicyTest {
                     120,
                     10),
                 risk(
-                    3,
-                    HedgerState.CONTROLLED,
-                    HedgeDirection.S),
+                    0,
+                    HedgerState.SAFE,
+                    HedgeDirection.X),
+                3,
                 false);
 
-        /*
-        * Same market observation must not advance EWMA.
-        */
         assertBigDecimal(
             "102.0",
             reevaluated.ewmaFair());
 
         /*
-        * Inventory still updates:
-        * +3 / 5 * -1.5 tick = -0.9 tick
-        */
+         * own +3 / hard 12 * -1.5 tick = -0.375 tick.
+         */
         assertBigDecimal(
-            "101.10",
+            "101.625",
             reevaluated.finalFair());
     }
 
@@ -464,9 +817,6 @@ class QuotePolicyTest {
                     HedgeDirection.X),
                 true);
 
-        /*
-        * 0.2 * 112 + 0.8 * 102 = 104
-        */
         assertBigDecimal(
             "104.00",
             next.ewmaFair());
@@ -547,5 +897,25 @@ class QuotePolicyTest {
             0,
             new BigDecimal(expected)
                 .compareTo(actual));
+    }
+
+@Test
+    void normalQuoteQuantityUsesExchangeMinimumVolume() {
+        Metadata exchangeMetadata =
+            Metadata.parse(
+                "AAH6",
+                "ticksize=1 ref_price=100 band=20 "
+                    + "min_volume=5 max_volume=25 "
+                    + "position_limit=12 max_tps=40");
+
+        QuotePolicy policy =
+            new QuotePolicy(
+                exchangeMetadata,
+                6,
+                12);
+
+        assertEquals(
+            5,
+            policy.normalQuoteQuantity());
     }
 }

@@ -9,12 +9,15 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 
 class QuoterOrderRequestClientTest {
 
@@ -604,6 +607,466 @@ class QuoterOrderRequestClientTest {
         }
     }
 
+    @Test
+    void tpsRollingWindowUsesMonotonicClockAndExpiresAtOneSecond() {
+        OrderManager manager =
+            new OrderManager();
+
+        FakeTransport transport =
+            new FakeTransport(manager);
+
+        ScheduledExecutorService scheduler =
+            Executors.newSingleThreadScheduledExecutor();
+
+        AtomicLong now =
+            new AtomicLong(0L);
+
+        OrderRequestClient client =
+            new OrderRequestClient(
+                SENDER,
+                FEED,
+                metadataWithMaxTps(3),
+                manager,
+                () -> true,
+                () -> true,
+                transport,
+                scheduler,
+                Duration.ofHours(1),
+                Duration.ofHours(1),
+                () -> {
+                },
+                now::get);
+
+        try (client) {
+            OrderRequestClient.AddReservation pair =
+                client.tryReserveAddCapacity(2);
+
+            assertNotNull(pair);
+
+            try (pair) {
+                client.requestAdd(
+                    OrderManager.Side.BID,
+                    "BIDTPS01",
+                    1,
+                    500,
+                    pair);
+
+                client.requestAdd(
+                    OrderManager.Side.ASK,
+                    "ASKTPS01",
+                    1,
+                    500,
+                    pair);
+            }
+
+            assertEquals(
+                2,
+                client.currentTpsUsageForTest());
+
+            manager.onExecution(
+                OrderManager.Side.BID,
+                "BIDTPS01",
+                1);
+
+            manager.onExecution(
+                OrderManager.Side.ASK,
+                "ASKTPS01",
+                1);
+
+            assertNull(
+                client.tryReserveAddCapacity(1));
+
+            now.set(999_999_999L);
+
+            assertNull(
+                client.tryReserveAddCapacity(1));
+
+            now.set(1_000_000_000L);
+
+            OrderRequestClient.AddReservation next =
+                client.tryReserveAddCapacity(1);
+
+            assertNotNull(next);
+            next.close();
+        }
+    }
+
+    @Test
+    void safePairRequiresTwoAddsPlusOneImmediateCancelCapacity() {
+        OrderManager manager =
+            new OrderManager();
+
+        ScheduledExecutorService scheduler =
+            Executors.newSingleThreadScheduledExecutor();
+
+        try (OrderRequestClient client =
+                new OrderRequestClient(
+                    SENDER,
+                    FEED,
+                    metadataWithMaxTps(2),
+                    manager,
+                    () -> true,
+                    () -> true,
+                    (subject, payload, timeout) ->
+                        new CompletableFuture<>(),
+                    scheduler,
+                    Duration.ofHours(1),
+                    Duration.ofHours(1))) {
+
+            assertNull(
+                client.tryReserveAddCapacity(2));
+        }
+
+        ScheduledExecutorService scheduler2 =
+            Executors.newSingleThreadScheduledExecutor();
+
+        try (OrderRequestClient client =
+                new OrderRequestClient(
+                    SENDER,
+                    FEED,
+                    metadataWithMaxTps(3),
+                    new OrderManager(),
+                    () -> true,
+                    () -> true,
+                    (subject, payload, timeout) ->
+                        new CompletableFuture<>(),
+                    scheduler2,
+                    Duration.ofHours(1),
+                    Duration.ofHours(1))) {
+
+            OrderRequestClient.AddReservation pair =
+                client.tryReserveAddCapacity(2);
+
+            assertNotNull(pair);
+            pair.close();
+        }
+    }
+
+    @Test
+    void cancelCanUseEmergencyCapacityWithoutStealingReservedSecondAdd() {
+        OrderManager manager =
+            new OrderManager();
+
+        FakeTransport transport =
+            new FakeTransport(manager);
+
+        ScheduledExecutorService scheduler =
+            Executors.newSingleThreadScheduledExecutor();
+
+        OrderRequestClient client =
+            new OrderRequestClient(
+                SENDER,
+                FEED,
+                metadataWithMaxTps(3),
+                manager,
+                () -> true,
+                () -> true,
+                transport,
+                scheduler,
+                Duration.ofHours(1),
+                Duration.ofHours(1));
+
+        try (client) {
+            OrderRequestClient.AddReservation pair =
+                client.tryReserveAddCapacity(2);
+
+            assertNotNull(pair);
+
+            try (pair) {
+                client.requestAdd(
+                    OrderManager.Side.BID,
+                    "BIDTPS02",
+                    1,
+                    500,
+                    pair);
+
+                manager.onResting(
+                    OrderManager.Side.BID,
+                    "BIDTPS02");
+
+                assertEquals(
+                    1,
+                    client.outstandingAddReservationsForTest());
+
+                client.requestCancel(
+                    OrderManager.Side.BID);
+
+                assertEquals(
+                    2,
+                    client.currentTpsUsageForTest());
+
+                assertEquals(
+                    1,
+                    client.outstandingAddReservationsForTest());
+            }
+
+            assertEquals(
+                0,
+                client.outstandingAddReservationsForTest());
+        }
+    }
+
+    @Test
+    void unknownCurrentOrderContributesCancelObligationToAddAdmission() {
+        OrderManager manager =
+            new OrderManager();
+
+        manager.beginAdd(
+            OrderManager.Side.BID,
+            "BIDTPS03",
+            1,
+            500L);
+
+        manager.markRequestUncertain(
+            OrderManager.Side.BID,
+            "BIDTPS03");
+
+        ScheduledExecutorService scheduler =
+            Executors.newSingleThreadScheduledExecutor();
+
+        try (OrderRequestClient client =
+                new OrderRequestClient(
+                    SENDER,
+                    FEED,
+                    metadataWithMaxTps(3),
+                    manager,
+                    () -> true,
+                    () -> true,
+                    (subject, payload, timeout) ->
+                        new CompletableFuture<>(),
+                    scheduler,
+                    Duration.ofHours(1),
+                    Duration.ofHours(1))) {
+
+            assertNull(
+                client.tryReserveAddCapacity(2));
+        }
+    }
+
+    @Test
+    void preTransportAddRejectionDoesNotConsumeTps() {
+        OrderManager manager =
+            new OrderManager();
+
+        AtomicBoolean addReady =
+            new AtomicBoolean(false);
+
+        AtomicInteger transportCalls =
+            new AtomicInteger();
+
+        ScheduledExecutorService scheduler =
+            Executors.newSingleThreadScheduledExecutor();
+
+        try (OrderRequestClient client =
+                new OrderRequestClient(
+                    SENDER,
+                    FEED,
+                    metadataWithMaxTps(2),
+                    manager,
+                    addReady::get,
+                    () -> true,
+                    (subject, payload, timeout) -> {
+                        transportCalls.incrementAndGet();
+                        return new CompletableFuture<>();
+                    },
+                    scheduler,
+                    Duration.ofHours(1),
+                    Duration.ofHours(1))) {
+
+            assertThrows(
+                IllegalStateException.class,
+                () -> client.requestAdd(
+                    OrderManager.Side.BID,
+                    "BIDTPS04",
+                    1,
+                    500));
+
+            assertEquals(
+                0,
+                client.currentTpsUsageForTest());
+
+            assertEquals(
+                0,
+                transportCalls.get());
+
+            assertEquals(
+                OrderManager.State.EMPTY,
+                manager.state(
+                    OrderManager.Side.BID));
+        }
+    }
+
+    @Test
+    void transportAttemptFailureStillConsumesTps() {
+        OrderManager manager =
+            new OrderManager();
+
+        AtomicInteger transportCalls =
+            new AtomicInteger();
+
+        ScheduledExecutorService scheduler =
+            Executors.newSingleThreadScheduledExecutor();
+
+        try (OrderRequestClient client =
+                new OrderRequestClient(
+                    SENDER,
+                    FEED,
+                    metadataWithMaxTps(2),
+                    manager,
+                    () -> true,
+                    () -> true,
+                    (subject, payload, timeout) -> {
+                        transportCalls.incrementAndGet();
+                        throw new RuntimeException("transport failed");
+                    },
+                    scheduler,
+                    Duration.ofHours(1),
+                    Duration.ofHours(1))) {
+
+            client.requestAdd(
+                OrderManager.Side.BID,
+                "BIDTPS05",
+                1,
+                500);
+
+            assertEquals(
+                1,
+                transportCalls.get());
+
+            assertEquals(
+                1,
+                client.currentTpsUsageForTest());
+
+            assertEquals(
+                OrderManager.State.UNKNOWN,
+                manager.state(
+                    OrderManager.Side.BID));
+        }
+    }
+
+    @Test
+    void pendingCancelDoesNotDoubleReserveFutureCancelCapacity() {
+        OrderManager manager =
+            new OrderManager();
+
+        manager.beginAdd(
+            OrderManager.Side.BID,
+            "BIDTPS06",
+            1,
+            500L);
+
+        manager.onResting(
+            OrderManager.Side.BID,
+            "BIDTPS06");
+
+        ScheduledExecutorService scheduler =
+            Executors.newSingleThreadScheduledExecutor();
+
+        try (OrderRequestClient client =
+                new OrderRequestClient(
+                    SENDER,
+                    FEED,
+                    metadataWithMaxTps(3),
+                    manager,
+                    () -> true,
+                    () -> true,
+                    (subject, payload, timeout) ->
+                        new CompletableFuture<>(),
+                    scheduler,
+                    Duration.ofHours(1),
+                    Duration.ofHours(1))) {
+
+            client.requestCancel(
+                OrderManager.Side.BID);
+
+            assertEquals(
+                OrderManager.State.PENDING_CANCEL,
+                manager.state(
+                    OrderManager.Side.BID));
+
+            OrderRequestClient.AddReservation next =
+                client.tryReserveAddCapacity(1);
+
+            assertNotNull(next);
+            next.close();
+        }
+    }
+
+    @Test
+    void eachUnknownCancelRetryConsumesFreshTpsPermit() {
+        OrderManager manager =
+            new OrderManager();
+
+        manager.beginAdd(
+            OrderManager.Side.BID,
+            "BIDTPS07",
+            1,
+            500L);
+
+        manager.onResting(
+            OrderManager.Side.BID,
+            "BIDTPS07");
+
+        AtomicInteger transportCalls =
+            new AtomicInteger();
+
+        ScheduledExecutorService scheduler =
+            Executors.newSingleThreadScheduledExecutor();
+
+        try (OrderRequestClient client =
+                new OrderRequestClient(
+                    SENDER,
+                    FEED,
+                    metadataWithMaxTps(2),
+                    manager,
+                    () -> true,
+                    () -> true,
+                    (subject, payload, timeout) -> {
+                        transportCalls.incrementAndGet();
+                        throw new RuntimeException("cancel transport failed");
+                    },
+                    scheduler,
+                    Duration.ofHours(1),
+                    Duration.ofHours(1))) {
+
+            client.requestCancel(
+                OrderManager.Side.BID);
+
+            assertEquals(
+                OrderManager.State.UNKNOWN,
+                manager.state(
+                    OrderManager.Side.BID));
+
+            client.requestCancel(
+                OrderManager.Side.BID);
+
+            assertEquals(
+                2,
+                client.currentTpsUsageForTest());
+
+            assertEquals(
+                2,
+                transportCalls.get());
+
+            client.requestCancel(
+                OrderManager.Side.BID);
+
+            assertEquals(
+                2,
+                transportCalls.get());
+        }
+    }
+
+    private static Metadata metadataWithMaxTps(
+            int maxTps) {
+
+        return Metadata.parse(
+            FEED,
+            "ticksize=1 ref_price=500 band=100 "
+                + "min_volume=1 max_volume=100 "
+                + "position_limit=12 max_tps="
+                + maxTps);
+    }
     private static void makeActiveAsk(
             OrderManager manager,
             String orderId,
@@ -626,7 +1089,7 @@ class QuoterOrderRequestClientTest {
             FEED,
             "ticksize="
                 + tickSize
-                + " ref_price=500 band=100");
+                + " ref_price=500 band=100 min_volume=1 max_volume=100 position_limit=200 max_tps=100");
     }
 
     private static byte[] bytes(
@@ -713,6 +1176,85 @@ class QuoterOrderRequestClientTest {
                 : new String(
                     requestPayload,
                     StandardCharsets.UTF_8);
+        }
+    }
+
+@Test
+    void addEnforcesExchangeMinAndMaxVolumeBeforeRegistration() {
+        OrderManager manager =
+            new OrderManager();
+
+        FakeTransport transport =
+            new FakeTransport(manager);
+
+        java.util.concurrent.ScheduledExecutorService scheduler =
+            java.util.concurrent.Executors
+                .newSingleThreadScheduledExecutor();
+
+        Metadata exchangeMetadata =
+            Metadata.parse(
+                FEED,
+                "ticksize=1 ref_price=500 band=100 "
+                    + "min_volume=5 max_volume=10 "
+                    + "position_limit=12 max_tps=40");
+
+        OrderRequestClient client =
+            new OrderRequestClient(
+                SENDER,
+                FEED,
+                exchangeMetadata,
+                manager,
+                () -> true,
+                () -> true,
+                transport,
+                scheduler,
+                java.time.Duration.ofHours(1),
+                java.time.Duration.ofHours(1));
+
+        try (client) {
+            assertThrows(
+                IllegalArgumentException.class,
+                () -> client.requestAdd(
+                    OrderManager.Side.BID,
+                    "BID00001",
+                    4,
+                    500));
+
+            assertThrows(
+                IllegalArgumentException.class,
+                () -> client.requestAdd(
+                    OrderManager.Side.BID,
+                    "BID00001",
+                    11,
+                    500));
+
+            assertEquals(
+                OrderManager.State.EMPTY,
+                manager.state(
+                    OrderManager.Side.BID));
+
+            assertEquals(
+                0,
+                transport.calls);
+
+            client.requestAdd(
+                OrderManager.Side.BID,
+                "BID00001",
+                5,
+                500);
+
+            assertEquals(
+                OrderManager.State.PENDING_ADD,
+                manager.state(
+                    OrderManager.Side.BID));
+
+            assertEquals(
+                1,
+                transport.calls);
+
+            assertEquals(
+                "QUOTE001 A AAH6 BID00001 B 5 500 L",
+                transport.payload());
         }
     }
 }

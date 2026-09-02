@@ -12,9 +12,6 @@ import java.util.Objects;
  */
 final class QuotePolicy {
 
-    static final int QUOTE_CLIP = 1;
-    static final int MAX_POSITION = 5;
-
     static final BigDecimal EWMA_ALPHA =
         new BigDecimal("0.2");
     static final BigDecimal BID_WEIGHT =
@@ -29,11 +26,30 @@ final class QuotePolicy {
         new BigDecimal("0.5");
 
     private static final int DIVISION_SCALE = 12;
+    private static final int DEFAULT_QUOTER_SOFT_POS = 6;
+    private static final int DEFAULT_QUOTER_HARD_POS = 12;
 
     private final Metadata metadata;
+    private final int quoterSoftPosition;
+    private final int quoterHardPosition;
     private BigDecimal ewmaFair;
 
+    /**
+     * Compatibility constructor for focused tests/foundation callers.
+     * Production passes the validated environment limits explicitly.
+     */
     QuotePolicy(Metadata metadata) {
+        this(
+            metadata,
+            DEFAULT_QUOTER_SOFT_POS,
+            DEFAULT_QUOTER_HARD_POS);
+    }
+
+    QuotePolicy(
+            Metadata metadata,
+            int quoterSoftPosition,
+            int quoterHardPosition) {
+
         this.metadata =
             Objects.requireNonNull(
                 metadata,
@@ -43,6 +59,21 @@ final class QuotePolicy {
             throw new IllegalArgumentException(
                 "metadata must be valid");
         }
+
+        if (quoterSoftPosition <= 0) {
+            throw new IllegalArgumentException(
+                "quoterSoftPosition must be positive");
+        }
+
+        if (quoterHardPosition < quoterSoftPosition) {
+            throw new IllegalArgumentException(
+                "quoterHardPosition must not be below quoterSoftPosition");
+        }
+
+        this.quoterSoftPosition =
+            quoterSoftPosition;
+        this.quoterHardPosition =
+            quoterHardPosition;
     }
 
     synchronized void reset() {
@@ -50,8 +81,19 @@ final class QuotePolicy {
     }
 
     /**
-     * Existing behavior: this call represents a new trusted BBO observation
-     * and therefore advances EWMA.
+     * V1 normal quote size is the Exchange minimum legal volume.
+     *
+     * Dynamic sizing is deliberately out of scope. Using the minimum legal
+     * clip minimizes incremental exposure while remaining portable across the
+     * private grading market.
+     */
+    int normalQuoteQuantity() {
+        return metadata.getMinVolume();
+    }
+
+    /**
+     * Compatibility behavior: no explicit local inventory supplied.
+     * Production always calls the own-position overload.
      */
     synchronized QuotePlan evaluate(
             Bbo bbo,
@@ -60,26 +102,51 @@ final class QuotePolicy {
         return evaluate(
             bbo,
             risk,
+            0,
+            true);
+    }
+
+    synchronized QuotePlan evaluate(
+            Bbo bbo,
+            DeskRiskMessage risk,
+            boolean advanceEwma) {
+
+        return evaluate(
+            bbo,
+            risk,
+            0,
+            advanceEwma);
+    }
+
+    synchronized QuotePlan evaluate(
+            Bbo bbo,
+            DeskRiskMessage risk,
+            int ownPosition) {
+
+        return evaluate(
+            bbo,
+            risk,
+            ownPosition,
             true);
     }
 
     /**
-     * Re-evaluates quoting policy with explicit control over EWMA advancement.
+     * Re-evaluates quoting policy with explicit Quoter-local inventory.
+     *
+     * DeskRiskMessage remains advisory combined-desk coordination. It is never
+     * used as Quoter inventory authority.
      *
      * advanceEwma=true:
      *   the BBO is a new trusted market observation.
      *
      * advanceEwma=false:
-     *   the caller is re-running policy because risk/lifecycle/timer state
-     *   changed while the market observation is unchanged. Inventory/risk
-     *   effects are recomputed, but the same BBO is not counted again in EWMA.
-     *
-     * If EWMA has just been reset, the first usable BBO seeds it even when
-     * advanceEwma=false. This keeps the policy fail-safe after reconnect/reset.
+     *   risk/lifecycle/inventory changed while the BBO observation is unchanged.
+     *   Inventory effects are recomputed without counting the same BBO twice.
      */
     synchronized QuotePlan evaluate(
             Bbo bbo,
             DeskRiskMessage risk,
+            int ownPosition,
             boolean advanceEwma) {
 
         if (!isUsableBbo(bbo)) {
@@ -137,12 +204,16 @@ final class QuotePolicy {
                                 .subtract(EWMA_ALPHA)));
         }
 
+        /*
+         * Quoter inventory skew is based only on Quoter's own authoritative
+         * signed inventory, never Hedger combined desk net.
+         */
         BigDecimal inventoryRatio =
             BigDecimal.valueOf(
-                    risk.getNetPosition())
+                    ownPosition)
                 .divide(
                     BigDecimal.valueOf(
-                        MAX_POSITION),
+                        quoterHardPosition),
                     DIVISION_SCALE,
                     RoundingMode.HALF_UP);
 
@@ -164,14 +235,25 @@ final class QuotePolicy {
             ewmaFair.add(
                 inventoryAdjustment);
 
+        /*
+         * Quoter-local inventory permission:
+         * once own inventory reaches the local soft boundary, suppress the side
+         * that can increase that inventory. Desk coordination is evaluated
+         * independently below; final Add permission is their intersection.
+         */
+        boolean localBidAllowed =
+            ownPosition < quoterSoftPosition;
+
+        boolean localAskAllowed =
+            ownPosition > -quoterSoftPosition;
+
         HedgerState effectiveRisk =
             effectiveRiskState(risk);
 
         /*
          * Candidate prices describe side-level economics and are deliberately
          * kept separate from new-Add permission. QuoteController needs them to
-         * decide whether an already-resting order can be kept even when SAFE
-         * pair policy suppresses a new one-sided Add.
+         * decide whether an already-resting order can be kept.
          */
         Long bidCandidate =
             chooseBid(
@@ -191,44 +273,90 @@ final class QuotePolicy {
 
         switch (effectiveRisk) {
             case SAFE:
-                bidAllowed = true;
-                askAllowed = true;
-
                 /*
-                 * Do not intentionally initiate a new one-sided SAFE pair.
+                 * SAFE is meaningful only with neutral direction X. Any
+                 * contradictory directional signal fails closed.
                  */
-                if (bidCandidate != null
-                        && askCandidate != null) {
+                if (risk.getHedgeDirection()
+                        != HedgeDirection.X) {
+                    break;
+                }
 
-                    permittedBid = bidCandidate;
-                    permittedAsk = askCandidate;
+                bidAllowed =
+                    localBidAllowed;
+                askAllowed =
+                    localAskAllowed;
+
+                if (localBidAllowed
+                        && localAskAllowed) {
+
+                    /*
+                     * Normal SAFE inventory: preserve the existing rule that
+                     * does not intentionally initiate a new one-sided pair.
+                     */
+                    if (bidCandidate != null
+                            && askCandidate != null) {
+
+                        permittedBid =
+                            bidCandidate;
+                        permittedAsk =
+                            askCandidate;
+                    }
+
+                } else if (localBidAllowed) {
+
+                    /*
+                     * Local short inventory at/through soft:
+                     * buying is risk-reducing and one-sided quoting is allowed.
+                     */
+                    permittedBid =
+                        bidCandidate;
+
+                } else if (localAskAllowed) {
+
+                    /*
+                     * Local long inventory at/through soft:
+                     * selling is risk-reducing and one-sided quoting is allowed.
+                     */
+                    permittedAsk =
+                        askCandidate;
                 }
                 break;
 
             case CONTROLLED:
+            case EMERGENCY:
                 /*
-                 * Positive desk position -> selling reduces risk.
-                 * Negative desk position -> buying reduces risk.
-                 * Direction/sign disagreement fails closed.
+                 * Hedger is the authoritative desk-risk classifier.
+                 * Quoter does not re-derive SAFE/CONTROLLED/EMERGENCY from the
+                 * desk net position.
+                 *
+                 * CONTROLLED/EMERGENCY direction must agree with the signed
+                 * desk position. Zero-net non-SAFE messages are semantically
+                 * inconsistent and therefore fail closed.
+                 *
+                 * Final permission is the intersection of desk-reducing
+                 * direction and Quoter-local soft-limit permission.
                  */
-                if (risk.getHedgeDirection()
+                if (risk.getNetPosition() > 0
+                        && risk.getHedgeDirection()
                             == HedgeDirection.S
-                        && risk.getNetPosition() > 0) {
+                        && localAskAllowed) {
 
                     askAllowed = true;
-                    permittedAsk = askCandidate;
+                    permittedAsk =
+                        askCandidate;
 
-                } else if (
-                    risk.getHedgeDirection()
+                } else if (risk.getNetPosition() < 0
+                        && risk.getHedgeDirection()
                             == HedgeDirection.B
-                        && risk.getNetPosition() < 0) {
+                        && localBidAllowed) {
 
                     bidAllowed = true;
-                    permittedBid = bidCandidate;
+                    permittedBid =
+                        bidCandidate;
                 }
                 break;
 
-            case EMERGENCY:
             case UNKNOWN:
                 break;
         }
@@ -383,48 +511,20 @@ final class QuotePolicy {
             finalFair.add(edge)) >= 0;
     }
 
+    /*
+     * Hedger is the single source of truth for combined desk-risk state.
+     * Quoter must never reinterpret desk net position through sample-specific
+     * local thresholds.
+     */
     private HedgerState effectiveRiskState(
             DeskRiskMessage risk) {
 
         HedgerState reported =
             risk.getState();
 
-        if (reported == HedgerState.UNKNOWN) {
-            return HedgerState.UNKNOWN;
-        }
-
-        int absPosition =
-            Math.abs(
-                risk.getNetPosition());
-
-        HedgerState positionDerived;
-
-        if (absPosition >= 5) {
-            positionDerived =
-                HedgerState.EMERGENCY;
-        } else if (absPosition >= 3) {
-            positionDerived =
-                HedgerState.CONTROLLED;
-        } else {
-            positionDerived =
-                HedgerState.SAFE;
-        }
-
-        return severity(reported)
-                    >= severity(positionDerived)
-            ? reported
-            : positionDerived;
-    }
-
-    private int severity(
-            HedgerState state) {
-
-        return switch (state) {
-            case SAFE -> 0;
-            case CONTROLLED -> 1;
-            case EMERGENCY -> 2;
-            case UNKNOWN -> 3;
-        };
+        return reported == null
+            ? HedgerState.UNKNOWN
+            : reported;
     }
 
     private boolean isUsableBbo(

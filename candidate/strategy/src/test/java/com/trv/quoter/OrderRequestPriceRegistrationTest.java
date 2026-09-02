@@ -24,7 +24,7 @@ class OrderRequestPriceRegistrationTest {
                 "AAH6",
                 Metadata.parse(
                     "AAH6",
-                    "ticksize=1 ref_price=500 band=100"),
+                    "ticksize=1 ref_price=500 band=100 min_volume=1 max_volume=100 position_limit=200 max_tps=100"),
                 manager,
                 () -> true,
                 () -> true,

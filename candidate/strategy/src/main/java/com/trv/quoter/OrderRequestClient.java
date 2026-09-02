@@ -3,12 +3,15 @@ package com.trv.quoter;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.ArrayDeque;
+import java.util.Deque;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
+import java.util.function.LongSupplier;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -23,6 +26,9 @@ final class OrderRequestClient implements AutoCloseable {
 
     private static final Logger logger =
         Logger.getLogger(OrderRequestClient.class.getName());
+
+    private static final long TPS_WINDOW_NANOS =
+        TimeUnit.SECONDS.toNanos(1);
 
     @FunctionalInterface
     interface RequestTransport {
@@ -43,6 +49,21 @@ final class OrderRequestClient implements AutoCloseable {
     private final Duration addUncertaintyTimeout;
     private final Duration cancelUncertaintyTimeout;
     private final Runnable lifecycleStateChanged;
+    private final LongSupplier monotonicClock;
+
+    /*
+     * Exchange TPS accounting is per feed and uses a monotonic one-second
+     * rolling window. requestTimesNanos contains only requests that actually
+     * crossed the transport boundary. Reservations are tracked separately and
+     * are never counted as usage until the request attempt is made.
+     */
+    private final Object tpsLock = new Object();
+    private final Deque<Long> requestTimesNanos =
+        new ArrayDeque<>();
+
+    private AddReservation activeAddReservation;
+    private int outstandingAddReservations;
+    private int outstandingCancelReservations;
 
     private volatile boolean closed;
 
@@ -142,6 +163,38 @@ final class OrderRequestClient implements AutoCloseable {
             Duration cancelUncertaintyTimeout,
             Runnable lifecycleStateChanged) {
 
+        this(
+            sender,
+            feed,
+            metadata,
+            orderManager,
+            addEnvironmentReady,
+            transportTrusted,
+            transport,
+            deadlineScheduler,
+            addUncertaintyTimeout,
+            cancelUncertaintyTimeout,
+            lifecycleStateChanged,
+            System::nanoTime);
+    }
+
+    /*
+     * Package-private deterministic-clock constructor for focused TPS tests.
+     */
+    OrderRequestClient(
+            String sender,
+            String feed,
+            Metadata metadata,
+            OrderManager orderManager,
+            BooleanSupplier addEnvironmentReady,
+            BooleanSupplier transportTrusted,
+            RequestTransport transport,
+            ScheduledExecutorService deadlineScheduler,
+            Duration addUncertaintyTimeout,
+            Duration cancelUncertaintyTimeout,
+            Runnable lifecycleStateChanged,
+            LongSupplier monotonicClock) {
+
         if (sender == null
                 || sender.length() != 8
                 || containsWhitespace(sender)) {
@@ -166,6 +219,11 @@ final class OrderRequestClient implements AutoCloseable {
         if (!feed.equals(metadata.getFeed())) {
             throw new IllegalArgumentException(
                 "feed does not match metadata feed");
+        }
+
+        if (!metadata.isValid()) {
+            throw new IllegalArgumentException(
+                "metadata must be valid");
         }
 
         this.orderManager =
@@ -198,6 +256,11 @@ final class OrderRequestClient implements AutoCloseable {
                 lifecycleStateChanged,
                 "lifecycleStateChanged is required");
 
+        this.monotonicClock =
+            Objects.requireNonNull(
+                monotonicClock,
+                "monotonicClock is required");
+
         validateDuration(
             addUncertaintyTimeout,
             "addUncertaintyTimeout");
@@ -214,6 +277,13 @@ final class OrderRequestClient implements AutoCloseable {
             cancelUncertaintyTimeout;
     }
 
+    /**
+     * Backward-compatible single-Add entry point.
+     *
+     * Production automatic quoting reserves the whole candidate batch before
+     * the first Add. Direct callers still receive the same safety semantics by
+     * reserving a one-Add batch here.
+     */
     void requestAdd(
             OrderManager.Side side,
             String orderId,
@@ -226,11 +296,44 @@ final class OrderRequestClient implements AutoCloseable {
         validateAddQuantity(quantity);
         validateAddPrice(price);
 
-        /*
-         * This is only the foundation safety gate.
-         * Profitability/inventory/adverse-selection policy belongs to the
-         * quote-policy stage.
-         */
+        AddReservation reservation =
+            tryReserveAddCapacity(1);
+
+        if (reservation == null) {
+            return;
+        }
+
+        try (reservation) {
+            requestAdd(
+                side,
+                orderId,
+                quantity,
+                price,
+                reservation);
+        }
+    }
+
+    /**
+     * Add using an already-admitted TPS reservation.
+     *
+     * A SAFE pair passes the same two-token reservation to both Add calls.
+     * Each token becomes actual TPS usage only immediately before the
+     * corresponding transport.request() attempt.
+     */
+    void requestAdd(
+            OrderManager.Side side,
+            String orderId,
+            int quantity,
+            long price,
+            AddReservation reservation) {
+
+        ensureOpen();
+        validateSide(side);
+        validateOrderId(orderId);
+        validateAddQuantity(quantity);
+        validateAddPrice(price);
+        validateAddReservation(reservation);
+
         if (!addEnvironmentReady.getAsBoolean()) {
             throw new IllegalStateException(
                 "environment is not ready for new exposure");
@@ -249,10 +352,6 @@ final class OrderRequestClient implements AutoCloseable {
                     "target order slot is not empty");
             }
 
-            /*
-             * Register local intent before network dispatch so an extremely
-             * fast A/E/T/C cannot arrive while the slot still appears EMPTY.
-             */
             orderManager.beginAdd(
                 side,
                 orderId,
@@ -279,7 +378,75 @@ final class OrderRequestClient implements AutoCloseable {
             orderId,
             payload,
             addUncertaintyTimeout,
-            true);
+            true,
+            reservation,
+            null);
+    }
+
+    /**
+     * Atomically admit one or more candidate Adds against Exchange max_tps.
+     *
+     * Admission: U + R + K + min(1, K) <= max_tps
+     *
+     * U = actual requests in the rolling one-second window.
+     * R = ACTIVE + PENDING_ADD + UNKNOWN(current) cancel obligations.
+     * K = candidate Add count.
+     * PENDING_CANCEL is excluded because its cancel request already owns or
+     * consumed TPS capacity.
+     */
+    AddReservation tryReserveAddCapacity(
+            int candidateAddCount) {
+
+        ensureOpen();
+
+        if (candidateAddCount <= 0) {
+            throw new IllegalArgumentException(
+                "candidateAddCount must be positive");
+        }
+
+        int cancellationObligations =
+            cancellationObligations();
+
+        long now =
+            monotonicClock.getAsLong();
+
+        synchronized (tpsLock) {
+            pruneTpsWindow(now);
+
+            if (activeAddReservation != null
+                    && !activeAddReservation.closed
+                    && activeAddReservation.remaining > 0) {
+
+                return null;
+            }
+
+            int emergencyReserve =
+                Math.min(
+                    1,
+                    candidateAddCount);
+
+            long required =
+                (long) requestTimesNanos.size()
+                    + outstandingCancelReservations
+                    + cancellationObligations
+                    + candidateAddCount
+                    + emergencyReserve;
+
+            if (required > metadata.getMaxTps()) {
+                return null;
+            }
+
+            AddReservation reservation =
+                new AddReservation(
+                    this,
+                    candidateAddCount);
+
+            activeAddReservation = reservation;
+            outstandingAddReservations =
+                candidateAddCount;
+
+            return reservation;
+        }
     }
 
     void requestCancel(
@@ -288,49 +455,79 @@ final class OrderRequestClient implements AutoCloseable {
         ensureOpen();
         validateSide(side);
 
-        /*
-         * Cancel is risk-reducing and does not require BBO/risk readiness.
-         * It does require a currently trusted transport.
-         */
         if (!transportTrusted.getAsBoolean()) {
             throw new IllegalStateException(
                 "transport is not trusted for cancel");
         }
 
-        final String orderId;
+        CancelReservation reservation =
+            tryReserveCancelCapacity();
 
-        synchronized (orderManager) {
-            orderId =
-                orderManager.orderId(side);
-
-            if (orderId == null) {
-                throw new IllegalStateException(
-                    "no current order to cancel");
-            }
-
-            /*
-             * ACTIVE -> PENDING_CANCEL.
-             * UNKNOWN remains UNKNOWN while recording cancel intent.
-             * Other states are rejected by OrderManager.
-             */
-            orderManager.beginCancel(
-                side,
-                orderId);
+        if (reservation == null) {
+            logger.warning(
+                "Quoter cancel deferred by exchange max_tps side="
+                    + side);
+            return;
         }
 
-        String payload =
-            sender
-                + " C "
-                + feed
-                + " "
-                + orderId;
+        try (reservation) {
+            final String orderId;
 
-        dispatch(
-            side,
-            orderId,
-            payload,
-            cancelUncertaintyTimeout,
-            false);
+            synchronized (orderManager) {
+                orderId =
+                    orderManager.orderId(side);
+
+                if (orderId == null) {
+                    throw new IllegalStateException(
+                        "no current order to cancel");
+                }
+
+                orderManager.beginCancel(
+                    side,
+                    orderId);
+            }
+
+            String payload =
+                sender
+                    + " C "
+                    + feed
+                    + " "
+                    + orderId;
+
+            dispatch(
+                side,
+                orderId,
+                payload,
+                cancelUncertaintyTimeout,
+                false,
+                null,
+                reservation);
+        }
+    }
+
+    private CancelReservation
+            tryReserveCancelCapacity() {
+
+        long now =
+            monotonicClock.getAsLong();
+
+        synchronized (tpsLock) {
+            pruneTpsWindow(now);
+
+            long committed =
+                (long) requestTimesNanos.size()
+                    + outstandingAddReservations
+                    + outstandingCancelReservations
+                    + 1L;
+
+            if (committed > metadata.getMaxTps()) {
+                return null;
+            }
+
+            outstandingCancelReservations++;
+
+            return new CancelReservation(this);
+        }
     }
 
     /*
@@ -356,7 +553,9 @@ final class OrderRequestClient implements AutoCloseable {
             String orderId,
             String payload,
             Duration uncertaintyTimeout,
-            boolean requiresAddEnvironmentReady) {
+            boolean requiresAddEnvironmentReady,
+            AddReservation addReservation,
+            CancelReservation cancelReservation) {
 
         try {
             deadlineScheduler.schedule(
@@ -420,6 +619,31 @@ final class OrderRequestClient implements AutoCloseable {
             orderManager.abortPendingAddIfCurrent(
                 side,
                 orderId);
+            return;
+        }
+
+        /*
+         * Convert reservation into actual TPS usage immediately before the
+         * transport attempt. A transport exception still consumes the token
+         * because the Exchange may have observed the request.
+         */
+        if (requiresAddEnvironmentReady) {
+            if (!consumeAddReservation(
+                    addReservation)) {
+
+                orderManager.abortPendingAddIfCurrent(
+                    side,
+                    orderId);
+                return;
+            }
+        } else if (!consumeCancelReservation(
+                cancelReservation)) {
+
+            markPendingUncertain(
+                side,
+                orderId,
+                "cancel TPS reservation was lost before dispatch",
+                null);
             return;
         }
 
@@ -594,12 +818,277 @@ final class OrderRequestClient implements AutoCloseable {
         }
     }
 
+    private int cancellationObligations() {
+        synchronized (orderManager) {
+            int count = 0;
+
+            count +=
+                hasFutureCancelObligation(
+                    OrderManager.Side.BID)
+                    ? 1
+                    : 0;
+
+            count +=
+                hasFutureCancelObligation(
+                    OrderManager.Side.ASK)
+                    ? 1
+                    : 0;
+
+            return count;
+        }
+    }
+
+    private boolean hasFutureCancelObligation(
+            OrderManager.Side side) {
+
+        OrderManager.State state =
+            orderManager.state(side);
+
+        return state == OrderManager.State.ACTIVE
+            || state == OrderManager.State.PENDING_ADD
+            || state == OrderManager.State.UNKNOWN;
+    }
+
+    private boolean consumeAddReservation(
+            AddReservation reservation) {
+
+        if (reservation == null
+                || reservation.owner != this) {
+
+            return false;
+        }
+
+        long now =
+            monotonicClock.getAsLong();
+
+        synchronized (tpsLock) {
+            pruneTpsWindow(now);
+
+            if (reservation.closed
+                    || reservation != activeAddReservation
+                    || reservation.remaining <= 0
+                    || outstandingAddReservations <= 0) {
+
+                return false;
+            }
+
+            reservation.remaining--;
+            outstandingAddReservations--;
+
+            if (reservation.remaining == 0) {
+                activeAddReservation = null;
+            }
+
+            requestTimesNanos.addLast(now);
+            assertTpsCommitmentWithinLimit();
+
+            return true;
+        }
+    }
+
+    private boolean consumeCancelReservation(
+            CancelReservation reservation) {
+
+        if (reservation == null
+                || reservation.owner != this) {
+
+            return false;
+        }
+
+        long now =
+            monotonicClock.getAsLong();
+
+        synchronized (tpsLock) {
+            pruneTpsWindow(now);
+
+            if (reservation.closed
+                    || reservation.consumed
+                    || outstandingCancelReservations <= 0) {
+
+                return false;
+            }
+
+            reservation.consumed = true;
+            outstandingCancelReservations--;
+            requestTimesNanos.addLast(now);
+            assertTpsCommitmentWithinLimit();
+
+            return true;
+        }
+    }
+
+    private void releaseAddReservation(
+            AddReservation reservation) {
+
+        synchronized (tpsLock) {
+            if (reservation.closed) {
+                return;
+            }
+
+            reservation.closed = true;
+
+            if (reservation == activeAddReservation) {
+                outstandingAddReservations -=
+                    reservation.remaining;
+
+                if (outstandingAddReservations < 0) {
+                    throw new IllegalStateException(
+                        "negative outstanding Add TPS reservation");
+                }
+
+                activeAddReservation = null;
+            }
+
+            reservation.remaining = 0;
+        }
+    }
+
+    private void releaseCancelReservation(
+            CancelReservation reservation) {
+
+        synchronized (tpsLock) {
+            if (reservation.closed) {
+                return;
+            }
+
+            reservation.closed = true;
+
+            if (!reservation.consumed) {
+                outstandingCancelReservations--;
+
+                if (outstandingCancelReservations < 0) {
+                    throw new IllegalStateException(
+                        "negative outstanding Cancel TPS reservation");
+                }
+            }
+        }
+    }
+
+    private void validateAddReservation(
+            AddReservation reservation) {
+
+        if (reservation == null
+                || reservation.owner != this) {
+
+            throw new IllegalArgumentException(
+                "valid Add TPS reservation is required");
+        }
+
+        synchronized (tpsLock) {
+            if (reservation.closed
+                    || reservation != activeAddReservation
+                    || reservation.remaining <= 0) {
+
+                throw new IllegalStateException(
+                    "Add TPS reservation is not active");
+            }
+        }
+    }
+
+    private void pruneTpsWindow(
+            long now) {
+
+        while (!requestTimesNanos.isEmpty()) {
+            long oldest =
+                requestTimesNanos.peekFirst();
+
+            if (now - oldest
+                    < TPS_WINDOW_NANOS) {
+
+                break;
+            }
+
+            requestTimesNanos.pollFirst();
+        }
+    }
+
+    private void assertTpsCommitmentWithinLimit() {
+        long committed =
+            (long) requestTimesNanos.size()
+                + outstandingAddReservations
+                + outstandingCancelReservations;
+
+        if (committed > metadata.getMaxTps()) {
+            throw new IllegalStateException(
+                "internal TPS commitment exceeded exchange max_tps");
+        }
+    }
+
+    int currentTpsUsageForTest() {
+        long now =
+            monotonicClock.getAsLong();
+
+        synchronized (tpsLock) {
+            pruneTpsWindow(now);
+            return requestTimesNanos.size();
+        }
+    }
+
+    int outstandingAddReservationsForTest() {
+        synchronized (tpsLock) {
+            return outstandingAddReservations;
+        }
+    }
+
+    static final class AddReservation
+            implements AutoCloseable {
+
+        private final OrderRequestClient owner;
+        private int remaining;
+        private boolean closed;
+
+        private AddReservation(
+                OrderRequestClient owner,
+                int remaining) {
+
+            this.owner = owner;
+            this.remaining = remaining;
+        }
+
+        int remainingForTest() {
+            synchronized (owner.tpsLock) {
+                return remaining;
+            }
+        }
+
+        @Override
+        public void close() {
+            owner.releaseAddReservation(this);
+        }
+    }
+
+    private static final class CancelReservation
+            implements AutoCloseable {
+
+        private final OrderRequestClient owner;
+        private boolean consumed;
+        private boolean closed;
+
+        private CancelReservation(
+                OrderRequestClient owner) {
+
+            this.owner = owner;
+        }
+
+        @Override
+        public void close() {
+            owner.releaseCancelReservation(this);
+        }
+    }
+
     private void validateAddQuantity(
             int quantity) {
 
-        if (quantity <= 0) {
+        if (!metadata.isVolumeWithinBounds(
+                quantity)) {
+
             throw new IllegalArgumentException(
-                "quantity must be positive");
+                "quantity must be within metadata volume bounds ["
+                    + metadata.getMinVolume()
+                    + ", "
+                    + metadata.getMaxVolume()
+                    + "], saw "
+                    + quantity);
         }
     }
 

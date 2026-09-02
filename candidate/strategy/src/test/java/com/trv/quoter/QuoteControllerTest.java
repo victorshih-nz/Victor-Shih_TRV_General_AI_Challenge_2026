@@ -349,7 +349,7 @@ class QuoteControllerTest {
     }
 
     @Test
-    void emergencyCancelsBothActiveSides() {
+    void emergencyCancelsRiskIncreasingBidAndKeepsProfitableReducingAsk() {
         Fixture f = fixture();
 
         active(
@@ -379,12 +379,20 @@ class QuoteControllerTest {
                         HedgerState.EMERGENCY,
                         HedgeDirection.S)));
 
+        /*
+         * Desk is EMERGENCY long. BID increases long exposure and must be
+         * cancelled in the same evaluation cycle.
+         */
         assertEquals(
             QuoteController.Action.CANCEL,
             decision.bid().action());
 
+        /*
+         * ASK reduces desk long exposure. It may remain resting while it still
+         * satisfies the existing profitability and keep rules.
+         */
         assertEquals(
-            QuoteController.Action.CANCEL,
+            QuoteController.Action.KEEP,
             decision.ask().action());
     }
 
