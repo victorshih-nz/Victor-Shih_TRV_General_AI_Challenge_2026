@@ -69,7 +69,7 @@ class QuoteControllerTest {
                         100,
                         10,
                         101,
-                        10),
+                        30),
                     risk(
                         0,
                         HedgerState.SAFE,
@@ -102,7 +102,7 @@ class QuoteControllerTest {
                         100,
                         10,
                         101,
-                        10),
+                        30),
                     risk(
                         0,
                         HedgerState.SAFE,

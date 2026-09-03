@@ -41,16 +41,16 @@ class QuotePolicyTest {
                     HedgeDirection.X));
 
         assertBigDecimal(
-            "102.0",
+            "105.0",
             plan.weightedMid());
         assertBigDecimal(
-            "102.0",
+            "105.0",
             plan.rawFair());
         assertBigDecimal(
-            "102.0",
+            "105.0",
             plan.ewmaFair());
         assertBigDecimal(
-            "102.0",
+            "105.0",
             plan.finalFair());
 
         assertEquals(
@@ -81,7 +81,7 @@ class QuotePolicyTest {
                     HedgeDirection.X));
 
         assertBigDecimal(
-            "102.5",
+            "105.5",
             plan.rawFair());
     }
 
@@ -103,7 +103,7 @@ class QuotePolicyTest {
                     HedgeDirection.X));
 
         assertBigDecimal(
-            "102.0",
+            "105.0",
             first.ewmaFair());
 
         QuotePolicy.QuotePlan second =
@@ -119,7 +119,7 @@ class QuotePolicyTest {
                     HedgeDirection.X));
 
         assertBigDecimal(
-            "104.00",
+            "107.00",
             second.ewmaFair());
     }
 
@@ -154,7 +154,7 @@ class QuotePolicyTest {
                     HedgeDirection.X));
 
         assertBigDecimal(
-            "112.0",
+            "115.0",
             plan.ewmaFair());
     }
 
@@ -180,7 +180,7 @@ class QuotePolicyTest {
                 12);
 
         assertBigDecimal(
-            "100.5",
+            "103.5",
             plan.finalFair());
 
         /*
@@ -215,7 +215,7 @@ class QuotePolicyTest {
                 0);
 
         assertBigDecimal(
-            "102.0",
+            "105.0",
             plan.finalFair());
     }
 
@@ -329,7 +329,7 @@ class QuotePolicyTest {
                     100,
                     10,
                     101,
-                    10),
+                    30),
                 risk(
                     0,
                     HedgerState.SAFE,
@@ -746,7 +746,7 @@ class QuotePolicyTest {
                 true);
 
         assertBigDecimal(
-            "102.0",
+            "105.0",
             first.ewmaFair());
 
         QuotePolicy.QuotePlan reevaluated =
@@ -764,14 +764,14 @@ class QuotePolicyTest {
                 false);
 
         assertBigDecimal(
-            "102.0",
+            "105.0",
             reevaluated.ewmaFair());
 
         /*
          * own +3 / hard 12 * -1.5 tick = -0.375 tick.
          */
         assertBigDecimal(
-            "101.625",
+            "104.625",
             reevaluated.finalFair());
     }
 
@@ -818,7 +818,7 @@ class QuotePolicyTest {
                 true);
 
         assertBigDecimal(
-            "104.00",
+            "107.00",
             next.ewmaFair());
     }
 
@@ -855,7 +855,7 @@ class QuotePolicyTest {
                 false);
 
         assertBigDecimal(
-            "112.0",
+            "115.0",
             seeded.ewmaFair());
     }
 
