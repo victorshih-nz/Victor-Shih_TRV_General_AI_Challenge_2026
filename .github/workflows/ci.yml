@@ -35,9 +35,7 @@ jobs:
             candidate/README.md
             candidate/docker-compose.yml
             candidate/REQUIREMENTS.md
-            candidate/DESIGN.md
             candidate/DEVELOPMENT_PLAN.md
-            candidate/TEST_PLAN.md
           )
 
           for file in "${required[@]}"; do
@@ -96,7 +94,7 @@ jobs:
           set -euo pipefail
 
           mapfile -t tests < <(
-            find candidate \
+            find candidate/tests \
               -type f \
               \( -name 'test_*.py' -o -name '*_test.py' \) \
               2>/dev/null || true
@@ -108,7 +106,7 @@ jobs:
           fi
 
           python -m pip install --quiet pytest nats-py
-          python -m pytest -q "${tests[@]}"
+          PYTHONPATH=candidate python -m pytest -q "${tests[@]}"
 
   java-quoter:
     name: Java Quoter

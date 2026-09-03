@@ -18,7 +18,7 @@ x-desk-env: &desk-env
   TAKER_SENDER: ${TAKER_SENDER:-PYTKR001}
   HEDGER_SENDER: ${HEDGER_SENDER:-HEDGE001}
   TAKER_FEED: ${TAKER_FEED-AAH6}
-  TAKER_RUN: "86400"
+  TAKER_RUN: ${TAKER_RUN-86400}
   QUOTER_SOFT_POS: ${QUOTER_SOFT_POS-6}
   QUOTER_HARD_POS: ${QUOTER_HARD_POS-12}
   DESK_SOFT_POS: ${DESK_SOFT_POS-6}
@@ -58,14 +58,17 @@ services:
   # Every seat gets the same feed, NATS URL, sender identities, and desk-risk
   # configuration so private-grader overrides cannot split the desk.
   #
-  # The existing taker additionally accepts its original momentum threshold.
+  # The existing taker additionally exposes its original company-provided runtime knobs.
   # TAKER_MAX_SPREAD is intentionally absent: the experimental Spread Gate was
   # not shipped.
   taker:
     build: ./taker
     environment:
       <<: *desk-env
+      TAKER_CLIP: ${TAKER_CLIP-3}
+      TAKER_MAX_POS: ${TAKER_MAX_POS-30}
       TAKER_THRESH: ${TAKER_THRESH-10}
+      TAKER_LAG: ${TAKER_LAG-5}
     depends_on:
       - exchange
     restart: on-failure

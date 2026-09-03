@@ -19,7 +19,7 @@ Authoritative challenge/runtime sources, when explicitly referenced:
 - `candidate/PROTOCOL.md`
 - supplied Docker/runtime configuration
 - the current approved Job prompt / Issue
-- explicitly referenced sections of `candidate/REQUIREMENTS.md` or `candidate/DESIGN.md`
+- explicitly referenced sections of `candidate/REQUIREMENTS.md`
 
 ## 2. Context Discipline
 
@@ -30,7 +30,6 @@ Read only:
 Do not automatically read:
 - `candidate/DEVELOPMENT_PLAN.md`
 - `candidate/FEATURE_DESIGN_IMPLEMENTATION_PLAN.md`
-- `candidate/TEST_PLAN.md`
 - `candidate/NOTES.md`
 - unrelated source directories
 - unrelated Git history
@@ -70,7 +69,7 @@ For tracked-seat accounting, sender-specific exchange `T` and `E` events are aut
 - Buy => positive quantity.
 - Sell => negative quantity.
 - Never infer authoritative position from requested order quantity.
-- Fill-and-Kill (`F`) may execute partially.
+- Fill-and-Kill (`F`) is atomic full-or-reject under the current company protocol; sender-specific `T/E` execution events remain authoritative for position accounting.
 - `Y <n>` is an execution acknowledgement, not a substitute for authoritative execution-event accounting.
 - Accumulate multiple execution events correctly.
 - Duplicate/redelivered execution events must not double-count.

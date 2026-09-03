@@ -943,3 +943,512 @@ This review reinforced the project rule that trading authority should fail
 closed when state is uncertain, while authoritative execution evidence should
 be preserved whenever it can still be validated.
 
+## Job 3.1B — Repeated Trading Evaluation and Profitability Diagnosis
+
+### Measurement Protocol and Scope
+
+Job 3.1 used repeated fixed-window evaluation before any profitability tuning.
+
+Three independent 360-second sample-market runs were executed with simulator
+seeds 1, 2, and 3. No production strategy parameter was changed between those
+baseline runs.
+
+The measurement tooling was passive: it subscribed to real NATS subjects,
+captured BBO/risk/request/execution evidence, reconstructed authoritative
+position from real Exchange T/E events, and calculated a mark-to-mid PnL proxy.
+The proxy is diagnostic only; it is not the private grader's final liquidation
+PnL.
+
+Runs 4 and 5 were reserved for uncertainty or high variability. They were not
+needed because the main safety and profitability findings repeated across the
+three initial seeds.
+
+### Baseline Safety Result
+
+All three runs preserved the desk's main safety invariants:
+
+- no FATAL runtime failure,
+- no container restart,
+- no unresolved Hedger outcome uncertainty,
+- no stale (`>= 1 s`) desk-risk exposure-creating Add,
+- no EMERGENCY state,
+- zero measured Hard exposure,
+- authoritative maximum absolute desk position of 8,
+- and no confirmed false-SAFE accounting defect.
+
+Risk and authoritative position remained bounded:
+
+| Seed | Risk net range | Authoritative net range | Max abs | Hard exposure |
+|---|---:|---:|---:|---:|
+| 1 | -8 .. +8 | -8 .. +8 | 8 | 0 ms |
+| 2 | -8 .. +8 | -8 .. +8 | 8 | 0 ms |
+| 3 | -8 .. +6 | -8 .. +6 | 8 | 0 ms |
+
+Run 2 produced one source-time `false_safe_candidate`: the reconstructed
+authoritative position reached `+6` while one observed risk publication still
+showed `+3 SAFE`. Causal review showed the next risk publication reported
+`+6 CONTROLLED` about 0.061 ms later, followed by a Hedger reduction to `+5 SAFE`.
+This was retained as evidence of a very short publication lag at the soft
+boundary, not treated as a Hard-risk breach or as justification to weaken any
+risk invariant.
+
+### Baseline Profitability
+
+The desk PnL proxy was negative in all three runs:
+
+| Seed | Market move | Desk | Taker | Quoter | Hedger |
+|---|---:|---:|---:|---:|---:|
+| 1 | +26.92% | -9,985.5 | -14,544 | -4,764.5 | +9,323 |
+| 2 | +1.00% | -11,149 | -14,803 | +2,617 | +1,037 |
+| 3 | -27.00% | -10,826 | -19,923 | +13,673 | -4,576 |
+
+Across all three runs:
+
+```text
+Desk    -31,960.5
+Taker   -49,270.0
+Quoter  +11,525.5
+Hedger   +5,784.0
+```
+
+The repeatable dominant loss source was therefore the legacy Taker rather than
+the Quoter or Hedger.
+
+This local PnL is a mark-to-mid diagnostic proxy. The private grading market is
+different from the sample market and the grader liquidates remaining inventory
+at session end, so these values are evidence for diagnosis rather than a claim
+about grader PnL.
+
+### Execution Attribution
+
+External Taker executions showed strongly negative economics:
+
+```text
+execution edge vs pre-fill mid    -8.050 / unit
+50 ms markout                    -14.098
+250 ms markout                   -15.746
+1 s markout                      -16.780
+5 s markout                      -23.053
+```
+
+The Taker was not losing only because it crossed the spread. After execution,
+the market also moved on average against the Taker's trade direction.
+
+Quoter behaviour was materially different:
+
+```text
+execution edge vs pre-fill mid    +1.704 / unit
+50 ms markout                     -5.067
+250 ms markout                    -3.650
+1 s markout                       -3.015
+5 s markout                       +0.391
+```
+
+This was consistent with passive spread capture followed by short-horizon
+adverse selection. Quoter was profitable in aggregate over the three baseline
+runs, so it was not selected as the first tuning target.
+
+The Hedger incurred expected aggressive execution cost but maintained its
+primary risk-control objective. No Hard exposure occurred in any baseline run,
+so Hedger redesign was also rejected as the first tuning target.
+
+Internal desk self-trading was negligible: 5 internal matches across the three
+runs, versus more than 1,200 unique matches overall. It was not a material
+source of the observed loss.
+
+### Analyzer Correction Before Tuning
+
+An initial exploratory counterfactual associated Taker requests with the latest
+BBO observed by the passive probe across different NATS subjects.
+
+That approach produced impossible reconstructions, including many apparent
+sub-threshold triggers and poor SELL direction matching. Because cross-subject
+probe receive order is not authoritative callback order, those results were
+rejected rather than used for tuning.
+
+A second reconstruction matched each Taker request to a nearby BBO with the
+same executable-side price and then independently verified the production
+`LAG=5` / `THRESH=10` momentum condition.
+
+Result:
+
+```text
+filled Taker trades reconstructed = 503 / 503
+exact trigger matches             = 503 / 503
+exact coverage                    = 100.0%
+
+mean BBO/request timing delta      = 0.483 ms
+p95                                = 1.327 ms
+maximum                            = 7.217 ms
+```
+
+Only this corrected reconstruction was used for the final tuning decision.
+
+### Competing Hypotheses
+
+#### Increasing the momentum threshold
+
+Increasing the minimum observed momentum did not improve post-fill economics:
+
+```text
+minimum signal     1 s markout     5 s markout
+10                  -17.044         -23.075
+20                  -18.230         -24.417
+30                  -20.305         -27.442
+```
+
+Stronger observed momentum was therefore not a useful first filter in the
+sample market.
+
+#### Reversing the signal
+
+A historical reversed-side counterfactual improved longer-horizon markout, but
+reversing the legacy strategy would change its core trading hypothesis rather
+than make one bounded risk-reducing adjustment. It was not selected as the
+first intervention.
+
+#### BBO directional imbalance / OFI-style confirmation
+
+Directional BBO imbalance contained some information but was insufficient on
+its own:
+
+```text
+directional imbalance >= 0.6
+1 s markout  = -11.774
+5 s markout  = -20.811
+```
+
+A full VPIN/OFI model would introduce extra state, assumptions, and tuning
+parameters without evidence that the additional complexity was required.
+Therefore it was rejected as the first intervention.
+
+#### Spread
+
+Spread was the strongest simple discriminator:
+
+```text
+all fills:
+  average spread = 23.892
+  1 s markout    = -17.044
+  5 s markout    = -23.075
+
+spread <= 10:
+  retained trades = 303 / 503
+  retained qty    = 905 / 1462
+  1 s markout     = -5.618
+  5 s markout     = -14.703
+```
+
+Wide-spread executions were particularly poor. Historical Taker fills with
+spread above 20 showed very negative immediate and post-fill economics.
+
+### Job 3.1B Decision
+
+> **Historical decision — superseded by the final Job 3.1 closure below.**
+> This section records the bounded experiment that the evidence justified at
+> that point in the investigation. The Spread Gate was subsequently evaluated
+> and deliberately not shipped. The final production decision is recorded in
+> **Job 3.1 closure - stopping sample-market profitability tuning**.
+
+The evidence supported one small next intervention:
+
+**Add a spread-aware exposure gate to the legacy Taker.**
+
+The first intervention will not:
+
+- increase `TAKER_THRESH`,
+- reverse the momentum strategy,
+- add a full VPIN/OFI model,
+- change Taker clip or maximum position,
+- weaken the fresh-SAFE or causal exposure barrier,
+- change Quoter pricing or inventory skew,
+- change Hedger execution logic,
+- or change desk Soft/Hard risk limits.
+
+The intended Job 3.1C rule is:
+
+```text
+existing fresh-SAFE gate
++ existing causal exposure barrier
++ complete momentum history
++ current BBO spread <= configured maximum
++ existing momentum trigger
+-> permit Taker Add
+```
+
+The maximum spread will be configurable as `TAKER_MAX_SPREAD`, with the default
+derived from the existing `TAKER_THRESH` price scale.
+
+Historical filtering is not treated as simulated PnL. Skipping Taker trades
+changes later position, Quoter, Hedger, and market-interaction paths. The change
+must therefore be validated with fresh live repeated runs before any
+profitability improvement is claimed.
+
+### Job 3.1B Status
+
+Result: **COMPLETE — diagnosis supported one bounded Job 3.1C experiment.**
+
+No production tuning was performed during Job 3.1B.
+
+## Job 3.1 closure - stopping sample-market profitability tuning
+
+I used repeated sample-market runs to understand whether the combined desk was stable and where the remaining losses came from, rather than treating the supplied simulator as a target to optimise indefinitely.
+
+Across the repeated baseline runs, desk exposure remained bounded while the legacy Taker was the most consistent source of losses. I therefore investigated its execution economics. The analysis showed both spread-crossing cost and adverse post-fill movement. A corrected trigger reconstruction also showed that wide-spread entries were associated with materially worse short-horizon outcomes.
+
+I experimented with one bounded spread filter and the preliminary result was promising. However, I decided not to continue tuning or ship that change at this stage. Returning to the original challenge requirements changed the priority: the Taker is legacy production code, the private grading market is different from the supplied sample market, and further profitability tuning risked overfitting the simulator or changing strategy behaviour without a correctness or safety justification.
+
+One earlier counterfactual analysis was also rejected after I found that it reconstructed triggers from cross-subject receive ordering, which was not a reliable causal ordering source. I kept the corrected analysis and the superseded script as evidence of how the conclusion changed rather than hiding the failed approach.
+
+The experimental Spread Gate is therefore retained only as research evidence. The production Taker is restored to the last committed correctness and desk-safety implementation. Remaining development effort is redirected to explicit company requirements, portability, final integration, and submission readiness.
+
+## Final Submission Summary — Jobs 3A, 3B, and 3C
+
+### Final Runtime Baseline
+
+The final runtime-validated production baseline is:
+
+```text
+b342020bca0ad4d0b019ba62616f63b867f0b405
+Support zero max_tps exchange metadata
+```
+
+The implementation was frozen after correctness, capital preservation,
+exchange-constraint handling, portability, and full-stack runtime validation
+were satisfied. No further sample-market profitability tuning was shipped.
+
+### Job 3A — Quoter and Desk Risk Hardening
+
+Job 3A hardened exposure control around authoritative execution and desk-risk
+state.
+
+Final properties include:
+
+- Quoter own inventory is derived only from authoritative own execution events.
+- Local Soft and Hard position controls are side-aware.
+- Existing and pending order exposure is included conservatively before another
+  Add is allowed.
+- Hedger desk risk remains authoritative for desk-wide state.
+- SAFE allows normal two-sided quoting subject to local limits.
+- CONTROLLED and EMERGENCY allow only the desk-risk-reducing side.
+- UNKNOWN allows no new exposure and triggers cancellation/reconciliation.
+- Late lifecycle events are re-evaluated against current risk instead of being
+  assumed safe from an earlier decision.
+- No dynamic quote sizing, edge relaxation, or predictive model was added.
+
+### Job 3B — Exchange Constraint Hardening
+
+Job 3B made exchange constraints first-class runtime controls.
+
+The final Quoter:
+
+- validates critical EX_META fields strictly;
+- uses exchange `min_volume` as quote size;
+- respects `max_volume`;
+- caps effective Quoter Hard position by exchange `position_limit`;
+- fails closed when metadata and configured limits are incompatible;
+- enforces exchange TPS immediately before actual transport requests;
+- reserves TPS capacity for lifecycle/cancel obligations;
+- gives cancellation priority over new exposure;
+- treats `max_tps=0` as no exchange TPS limit and rejects negative values; and
+- preserves explicit environment overrides through Docker Compose.
+
+Runtime packaging was also hardened so the strategy, Taker, and Hedger build
+from source inside linux/amd64 Docker images.
+
+The repository executable mode of `run.sh` and `setup.sh` was corrected to
+`100755` because the grader invokes `./run.sh` directly.
+
+### Job 3C — Final Runtime Validation
+
+Final Stage A validation was run from a fresh Git clone of the exact baseline
+above and launched through the grading entrypoint:
+
+```text
+./run.sh --sim --strategy
+```
+
+The clean-checkout run passed:
+
+- exact branch and HEAD verification;
+- tracked shell/Python LF line-ending checks;
+- executable-mode checks for `run.sh` and `setup.sh`;
+- Docker host preflight;
+- startup of all six required services;
+- linux/amd64 image verification for Taker, Quoter, and Hedger;
+- zero container restarts;
+- passive risk/BBO/lifecycle observation;
+- normal two-sided Quoter activity;
+- runtime log scanning;
+- final pre-shutdown service health; and
+- graceful Docker Compose shutdown and cleanup.
+
+During the final passive observation window:
+
+```text
+Quoter BID Adds                         365
+Quoter ASK Adds                         201
+first observed risk before exposure    true
+SAFE risk messages                     959
+CONTROLLED risk messages                61
+Quoter NATS disconnect events           0
+TPS-deferred Quoter cancels             0
+container restart counts                0
+```
+
+The sample market naturally exercised both SAFE and CONTROLLED transitions.
+EMERGENCY and UNKNOWN were not naturally reached during this particular final
+observation window; their behaviour is covered by focused tests and earlier
+controlled runtime fault-injection work rather than being claimed as events from
+this final run.
+
+The final Stage A log scan found no exchange 306/307 violation, TPS violation,
+disconnect loop, unhandled exception, fatal runtime failure, or container
+restart.
+
+### Validation Tooling Corrections
+
+The final validation process also exposed two defects in the validation tooling
+itself.
+
+First, an early Stage A script inspected a different Docker Compose project name
+from the project created by the exact `run.sh` entrypoint. The containers were
+actually healthy. The validation script was corrected without changing
+production code.
+
+Second, the passive lifecycle observer initially parsed Exchange market-data
+events without accounting for the protocol timestamp prefix. This produced a
+false zero/zero BID/ASK count. The observer was corrected to parse the documented
+timestamp-prefixed market-data format, again without changing production code.
+
+These failures were retained as part of the development record because they
+demonstrate the distinction between a real production blocker and a faulty test
+assumption.
+
+### Final Profitability Decision
+
+Repeated sample-market measurement showed the Quoter profitable in aggregate in
+the diagnostic mark-to-mid analysis, while the legacy Taker was the dominant
+source of desk loss.
+
+A spread-aware Taker filter was investigated because historical analysis showed
+that wide-spread entries had materially worse economics. The experiment was not
+shipped.
+
+The final decision was to avoid further tuning against the supplied simulator
+because:
+
+- the private grading market is different;
+- historical filtering is not equivalent to a live counterfactual;
+- additional Taker strategy changes risk overfitting the sample market; and
+- correctness, risk control, reliability, and grader portability had stronger
+  evidence and higher priority.
+
+The production submission therefore retains the validated Taker correctness and
+desk-safety controls without `TAKER_MAX_SPREAD`.
+
+### Final Status
+
+```text
+Job 3A  Own + Desk Risk Hardening       PASS
+Job 3B  Exchange Constraint Hardening   PASS
+Job 3C  Final Runtime Validation        PASS
+
+Final validated baseline:
+b342020bca0ad4d0b019ba62616f63b867f0b405
+```
+
+The final submission should be built from this validated production baseline
+plus the development notes, probes, helper/test tooling, research evidence, and
+the complete AI-agent transcript.
+
+## Final Compliance & Architecture Cleanup
+
+This cleanup was performed after the validated `b342020` runtime baseline and
+before the final post-cleanup validation pass. It does not intentionally change
+the live trading algorithms.
+
+### Retired early Quoter foundation
+
+The initial Java Quoter foundation explored a decomposed valuation/readiness
+design through `QuoterConfig`, `MarketReadiness`, `FairValueCalculator`,
+`EwmaMovement`, `AdaptiveValueBand`, and `ValuationSignal`.
+
+As real NATS integration, execution-driven inventory, desk-risk coordination,
+reconciliation, and TPS protection were implemented, the live runtime converged
+on `QuoterIntegration -> AutomaticQuoteEngine -> QuotePolicy / RuntimeState /
+QuoteController`.
+
+Those early classes were no longer on the live trading path. They were retired
+before submission so the delivered source presents one production architecture.
+Their exact pre-cleanup source and the old `QuoterFoundationTests` were copied
+to the local `final-architecture-cleanup` evidence snapshot and remain
+recoverable from Git history at `b342020`.
+
+Responsibility mapping:
+
+| Retired foundation | Final production responsibility |
+| --- | --- |
+| `QuoterConfig` | direct environment validation, `LocalRiskLimits`, and explicit `QuotePolicy` constants |
+| `MarketReadiness` | `RuntimeState` plus reconciliation/transport health |
+| `FairValueCalculator` | `QuotePolicy` fair-value calculation |
+| `EwmaMovement` | `QuotePolicy` EWMA fair smoothing |
+| `AdaptiveValueBand` | explored design not retained in the final policy |
+| `ValuationSignal` | direct fair-value / Minimum Edge logic in `QuotePolicy` |
+
+The retained `QuoterFoundationTests` now cover still-live `Metadata` and `Bbo`
+protocol contracts. Final readiness and pricing/risk behavior remain covered by
+their dedicated runtime/policy tests.
+
+### Taker runtime configuration portability
+
+The supplied legacy Taker already defines environment knobs for clip, local
+maximum position, momentum threshold, momentum lag, feed, and run duration.
+The supplied full-stack Compose configuration keeps the Taker alive for 86400
+seconds.
+
+Final Compose defaults preserve the supplied behavior while allowing grader
+environment overrides to reach the Taker container:
+
+- `TAKER_FEED=AAH6` only as the supplied sample-market fallback
+- `TAKER_CLIP=3`
+- `TAKER_MAX_POS=30`
+- `TAKER_THRESH=10`
+- `TAKER_LAG=5`
+- `TAKER_RUN=86400` for the full-stack fallback
+
+An explicit grader `TAKER_FEED` or other Taker setting overrides the fallback.
+The experimental `TAKER_MAX_SPREAD` is not shipped.
+
+### Process-document cleanup
+
+`DESIGN.md` and `TEST_PLAN.md` were workflow planning documents containing
+superseded intermediate state, so they were removed rather than presented as
+current final architecture. CI required-file checks and Copilot instructions
+were updated accordingly. The Copilot Fill-and-Kill instruction was corrected
+to the current company rule: `F` is atomic full-or-reject; sender-specific
+`T/E` execution events remain authoritative for position accounting.
+
+### Validation boundary
+
+This A-F phase only backs up, documents, and simplifies the final deliverable.
+Maven/Python tests, CI-equivalent checks, Docker validation, the exact
+`./run.sh --sim --strategy` runtime, and the new final-baseline freeze belong to
+the separate G-J validation phase.
+### Production CI test scope
+
+Final validation identified a test-infrastructure issue rather than a trading
+logic defect.
+
+Python production regression tests import the delivered `hedger` and `taker`
+packages from the `candidate` root. GitHub Actions therefore runs those tests
+with `PYTHONPATH=candidate`.
+
+The final CI pytest discovery scope is `candidate/tests`. Experimental material
+under `candidate/research` is preserved as development evidence but is not part
+of the production regression suite.
+
+In particular, the rejected Job 3.1 Spread Gate experiment remains preserved as
+`taker_spread_gate_RESEARCH_ONLY.py`; its filename intentionally does not match
+the CI `test_*.py` / `*_test.py` discovery patterns. The Spread Gate itself is
+not shipped in the final Taker.
