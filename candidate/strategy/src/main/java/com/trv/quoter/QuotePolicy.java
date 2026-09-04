@@ -416,7 +416,7 @@ final class QuotePolicy {
         }
 
         return wirePrice.compareTo(
-            finalFair.add(edge)) >= 0;
+                finalFair.add(edge)) >= 0;
     }
 
     private Long chooseBid(
@@ -496,7 +496,7 @@ final class QuotePolicy {
                 .multiply(MIN_EDGE_TICKS);
 
         return price.compareTo(
-            finalFair.subtract(edge)) <= 0;
+                finalFair.subtract(edge)) <= 0;
     }
 
     private boolean isProfitableAsk(
@@ -508,7 +508,7 @@ final class QuotePolicy {
                 .multiply(MIN_EDGE_TICKS);
 
         return price.compareTo(
-            finalFair.add(edge)) >= 0;
+                finalFair.add(edge)) >= 0;
     }
 
     /*
