@@ -15,9 +15,9 @@ final class QuotePolicy {
     static final BigDecimal EWMA_ALPHA =
         new BigDecimal("0.2");
     static final BigDecimal BID_WEIGHT =
-        new BigDecimal("0.8");
+        new BigDecimal("0.5");
     static final BigDecimal ASK_WEIGHT =
-        new BigDecimal("0.2");
+        new BigDecimal("0.5");
     static final BigDecimal MAX_MICRO_ADJ_TICKS =
         new BigDecimal("1.0");
     static final BigDecimal INVENTORY_SKEW_FACTOR_TICKS =
@@ -416,7 +416,7 @@ final class QuotePolicy {
         }
 
         return wirePrice.compareTo(
-            finalFair.add(edge)) >= 0;
+                finalFair.add(edge)) >= 0;
     }
 
     private Long chooseBid(
@@ -496,7 +496,7 @@ final class QuotePolicy {
                 .multiply(MIN_EDGE_TICKS);
 
         return price.compareTo(
-            finalFair.subtract(edge)) <= 0;
+                finalFair.subtract(edge)) <= 0;
     }
 
     private boolean isProfitableAsk(
@@ -508,7 +508,7 @@ final class QuotePolicy {
                 .multiply(MIN_EDGE_TICKS);
 
         return price.compareTo(
-            finalFair.add(edge)) >= 0;
+                finalFair.add(edge)) >= 0;
     }
 
     /*
